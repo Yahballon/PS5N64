@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="n64/sce_sys/icon0.png" width="180" alt="PS5N64 logo">
-</p>
-
 # PS5N64
 <p align="center">
   <img src="screenshots/background.png" alt="PS5NES game shelf">
