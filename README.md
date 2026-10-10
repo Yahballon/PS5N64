@@ -4,10 +4,6 @@
 
 # PS5N64
 
-**Nintendo 64 games on your PS5, with the original PS5SX2 cover-flow interface.**
-
-**AI-assisted development**
-
 PS5N64 is a native PS5 homebrew Nintendo 64 emulator using the **ParaLLEl N64 / Mupen64Plus core**.
 
 It keeps the original PS5SX2-style shelf, animated game cases, cover glow, reflections, menu sounds and settings panel, with a Nintendo 64 backend.
