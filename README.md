@@ -3,7 +3,9 @@
 </p>
 
 # PS5N64
-
+<p align="center">
+  <img src="screenshots/background.png" alt="PS5NES game shelf">
+</p>
 PS5N64 is a native PS5 homebrew Nintendo 64 emulator using the **ParaLLEl N64 / Mupen64Plus core**.
 
 It keeps the original PS5SX2-style shelf, animated game cases, cover glow, reflections, menu sounds and settings panel, with a Nintendo 64 backend.
