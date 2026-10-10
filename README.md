@@ -6,8 +6,6 @@
 
 **Nintendo 64 games on your PS5, with the original PS5SX2 cover-flow interface.**
 
-**v7 — modded by YAHBALLON** · **App ID: PPSA99206**
-
 **AI-assisted development**
 
 PS5N64 is a native PS5 homebrew Nintendo 64 emulator using the **ParaLLEl N64 / Mupen64Plus core**.
