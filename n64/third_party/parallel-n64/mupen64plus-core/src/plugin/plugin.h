@@ -1,0 +1,102 @@
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ *   Mupen64plus - plugin.h                                                *
+ *   Mupen64Plus homepage: https://mupen64plus.org/                        *
+ *   Copyright (C) 2002 Hacktarux                                          *
+ *   Copyright (C) 2009 Richard Goedeken                                   *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program; if not, write to the                         *
+ *   Free Software Foundation, Inc.,                                       *
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.          *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+#ifndef PLUGIN_H
+#define PLUGIN_H
+
+#include "api/m64p_common.h"
+#include "api/m64p_plugin.h"
+#include "api/m64p_types.h"
+#include "mupen64plus-next_common.h"
+
+extern GFX_INFO gfx_info;
+
+extern CONTROL Controls[4];
+
+extern m64p_error plugin_connect(m64p_plugin_type, m64p_dynlib_handle plugin_handle);
+extern m64p_error plugin_start(m64p_plugin_type);
+extern m64p_error plugin_check(void);
+extern void plugin_connect_all(void);
+
+enum { NUM_CONTROLLER = 4 };
+extern CONTROL Controls[NUM_CONTROLLER];
+
+/*** Version requirement information ***/
+#define RSP_API_VERSION   0x20000
+#define GFX_API_VERSION   0x20200
+#define AUDIO_API_VERSION 0x20000
+#define INPUT_API_VERSION 0x20101
+
+/* video plugin function pointers */
+typedef struct _gfx_plugin_functions
+{
+	ptr_PluginGetVersion getVersion;
+	ptr_ChangeWindow     changeWindow;
+	ptr_InitiateGFX      initiateGFX;
+	ptr_MoveScreen       moveScreen;
+	ptr_ProcessDList     processDList;
+	ptr_ProcessRDPList   processRDPList;
+	ptr_RomClosed        romClosed;
+	ptr_RomOpen          romOpen;
+	ptr_ShowCFB          showCFB;
+	ptr_UpdateScreen     updateScreen;
+	ptr_ViStatusChanged  viStatusChanged;
+	ptr_ViWidthChanged   viWidthChanged;
+	ptr_ReadScreen2      readScreen;
+	ptr_SetRenderingCallback setRenderingCallback;
+    ptr_ResizeVideoOutput    resizeVideoOutput;
+
+	/* frame buffer plugin spec extension */
+	ptr_FBRead          fBRead;
+	ptr_FBWrite         fBWrite;
+	ptr_FBGetFrameBufferInfo fBGetFrameBufferInfo;
+} gfx_plugin_functions;
+
+extern gfx_plugin_functions gfx;
+
+
+/* Direct libretro input entry points. Formerly these were dispatched
+ * through the input_plugin_functions struct, which in this build was a
+ * compile-time-constant table (dummy_input) that never changed, so the
+ * indirection is replaced with direct calls. */
+extern void inputControllerCommand(int Control, unsigned char *Command);
+extern void inputGetKeys(int Control, BUTTONS *Keys);
+extern void inputGetKeysGCN(int Control, int analogMode, BUTTONS_GCN *Keys);
+extern void inputInitiateControllers(CONTROL_INFO ControlInfo);
+extern void inputReadController(int Control, unsigned char *Command);
+extern int  inputRomOpen(void);
+extern void inputRomClosed(void);
+
+/* RSP plugin function pointers */
+typedef struct _rsp_plugin_functions
+{
+	ptr_PluginGetVersion    getVersion;
+	ptr_DoRspCycles         doRspCycles;
+	ptr_InitiateRSP         initiateRSP;
+	ptr_RomClosed           romClosed;
+} rsp_plugin_functions;
+
+extern rsp_plugin_functions rsp;
+extern rsp_plugin_functions rsp_audio;
+
+#endif
+

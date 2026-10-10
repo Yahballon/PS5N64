@@ -1,0 +1,1283 @@
+DEBUG=0
+PERF_TEST=0
+HAVE_SHARED_CONTEXT=0
+WITH_CRC=brumme
+FORCE_GLES=0
+HAVE_OPENGL=1
+HAVE_VULKAN_DEBUG=0
+GLIDEN64=0
+GLIDEN64ES=0
+HAVE_RSP_DUMP=0
+HAVE_RDP_DUMP=0
+HAVE_GLIDE64=1
+HAVE_GLIDEN64=1
+HAVE_GLN64=1
+HAVE_RICE=1
+HAVE_PARALLEL?=0
+HAVE_PARALLEL_RSP?=0
+HAVE_THR_AL?=1
+STATIC_LINKING=0
+HAVE_LTCG ?= 0
+
+DYNAFLAGS :=
+INCFLAGS  :=
+COREFLAGS :=
+CPUFLAGS  :=
+GLFLAGS   :=
+
+UNAME=$(shell uname -a)
+
+SPACE :=
+SPACE := $(SPACE) $(SPACE)
+BACKSLASH :=
+BACKSLASH := \$(BACKSLASH)
+filter_out1 = $(filter-out $(firstword $1),$1)
+filter_out2 = $(call filter_out1,$(call filter_out1,$1))
+
+ifeq ($(HAVE_VULKAN_DEBUG),1)
+HAVE_RSP_DUMP=1
+HAVE_RDP_DUMP=1
+endif
+
+# Dirs
+ROOT_DIR := .
+LIBRETRO_DIR := $(ROOT_DIR)/libretro
+
+ifeq ($(platform),)
+   platform = unix
+   ifeq ($(UNAME),)
+      platform = win
+   else ifneq ($(findstring MINGW,$(UNAME)),)
+      platform = win
+   else ifneq ($(findstring Darwin,$(UNAME)),)
+      platform = osx
+   else ifneq ($(findstring win,$(UNAME)),)
+      platform = win
+   endif
+else ifneq (,$(findstring armv,$(platform)))
+   override platform += unix
+else ifneq (,$(findstring rpi,$(platform)))
+   override platform += unix
+else ifneq (,$(findstring odroid,$(platform)))
+   override platform += unix
+else ifneq (,$(findstring webos,$(platform)))
+   override platform += unix
+endif
+
+# system platform
+system_platform = unix
+ifeq ($(shell uname -a),)
+   EXE_EXT = .exe
+   system_platform = win
+else ifneq ($(findstring Darwin,$(shell uname -a)),)
+   system_platform = osx
+   arch = intel
+	ifeq ($(shell uname -p),arm)
+		arch = arm
+	endif
+ifeq ($(shell uname -p),powerpc)
+   arch = ppc
+endif
+else ifneq ($(findstring MINGW,$(shell uname -a)),)
+   system_platform = win
+endif
+
+# Cross compile ?
+
+ifeq (,$(ARCH))
+   ARCH = $(shell uname -m)
+endif
+
+# Target Dynarec
+WITH_DYNAREC = $(ARCH)
+
+ifeq ($(ARCH), $(filter $(ARCH), i386 i686))
+   WITH_DYNAREC = x86
+else ifeq ($(ARCH), $(filter $(ARCH), arm))
+   WITH_DYNAREC = arm
+else ifeq ($(ARCH), $(filter $(ARCH), aarch64 arm64))
+   WITH_DYNAREC = aarch64
+endif
+
+ifeq ($(HAVE_VULKAN_DEBUG),1)
+TARGET_NAME := parallel_n64_debug
+else
+TARGET_NAME := parallel_n64
+endif
+
+CC_AS ?= $(CC)
+
+GIT_VERSION ?= " $(shell git rev-parse --short HEAD || echo unknown)"
+ifneq ($(GIT_VERSION)," unknown")
+   COREFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
+endif
+
+# Unix
+ifneq (,$(findstring unix,$(platform)))
+   TARGET := $(TARGET_NAME)_libretro.so
+   LDFLAGS += -shared -Wl,--no-undefined
+   ifeq ($(DEBUG_JIT),)
+      LDFLAGS += -Wl,--version-script=$(LIBRETRO_DIR)/link.T
+   endif
+   fpic = -fPIC
+
+   HAVE_THR_AL=1
+   LDFLAGS += -lpthread
+   # clock_gettime (libretro-common features_cpu.c) lives in librt on
+   # pre-2.17 glibc and some cross toolchains; harmless on modern glibc
+   # where it is in libc (the linker drops the unused -lrt).
+   LDFLAGS += -lrt
+   # dlopen (GLideN64's GraphicBuffer loader) lives in libdl before glibc
+   # 2.34; the link is --no-undefined, so it has to be named.
+   LDFLAGS += -ldl
+
+
+
+   ifeq ($(FORCE_GLES),1)
+      GLES = 1
+   else ifneq (,$(findstring gles,$(platform)))
+      GLES = 1
+   endif
+
+   # Raspberry Pi
+   ifneq (,$(findstring rpi,$(platform)))
+      GLES = 1
+      WITH_DYNAREC=arm
+      CPUFLAGS += -DARM_FIX
+
+      ifeq (,$(findstring mesa,$(platform)))
+         INCFLAGS += -I/opt/vc/include -I/opt/vc/include/interface/vcos -I/opt/vc/include/interface/vcos/pthreads
+      endif
+
+      ifneq (,$(findstring rpi2,$(platform)))
+         CPUFLAGS += -DNO_ASM -DARM -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE
+         CPUFLAGS += -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+         HAVE_NEON = 1
+      else ifneq (,$(findstring rpi3,$(platform)))
+         CPUFLAGS += -DNO_ASM -DARM -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE
+         CPUFLAGS += -mcpu=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+         HAVE_NEON = 1
+      # Raspberry pi 4 in 64bit mode with VULKAN
+      else ifneq (,$(findstring rpi4_64,$(platform)))
+         CPUFLAGS += -DNO_ASM -DARM -DARM_ASM -DDONT_WANT_ARM_OPTIMIZATIONS -DARM_FIX -DCLASSIC -DARM64
+         CPUFLAGS += -march=armv8-a+crc+simd -mtune=cortex-a72
+         HAVE_PARALLEL = 1
+         WITH_DYNAREC = aarch64
+         HAVE_NEON = 0
+         HAVE_OPENGL = 0
+         GLES = 0
+      else
+         CPUFLAGS += -DARMv5_ONLY -DNO_ASM
+      endif
+
+   endif
+   
+   # ODROIDs
+   ifneq (,$(findstring odroid,$(platform)))
+      BOARD ?= $(shell cat /proc/cpuinfo | grep -i odroid | awk '{print $$3}')
+      GLES = 1
+      CPUFLAGS += -DNO_ASM -DARM -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE -DARM_FIX
+      CPUFLAGS += -marm -mfloat-abi=hard
+      HAVE_NEON = 1
+      WITH_DYNAREC=arm
+      ifneq (,$(findstring ODROIDC,$(BOARD)))
+         # ODROID-C1
+         CPUFLAGS += -mcpu=cortex-a5 -mfpu=neon
+      else ifneq (,$(findstring ODROID-XU,$(BOARD)))
+         # ODROID-XU3 XU4 and XU3-Lite
+         CPUFLAGS += -mcpu=cortex-a15 -mtune=cortex-a15.cortex-a7 -mfpu=neon-vfpv4
+      else
+         # ODROID-U3, U2, X2 & X
+          CPUFLAGS += -mcpu=cortex-a9 -mfpu=neon
+      endif
+   endif
+   
+   # webOS
+   ifneq (,$(findstring webos,$(platform)))
+      GLES = 1
+      GL_LIB := -lGLESv2
+      ifneq (,$(findstring aarch64,$(CROSS_COMPILE)))
+         CPUFLAGS += -DARM -DDONT_WANT_ARM_OPTIMIZATIONS -DARM64
+         WITH_DYNAREC=aarch64
+         HAVE_NEON = 0
+      else
+         CPUFLAGS += -DARM -D__arm__ -D__NEON_OPT -DNOSSE
+         CPUFLAGS += -marm -mfloat-abi=softfp
+         CPUFLAGS += -mcpu=cortex-a9 -mfpu=neon
+         WITH_DYNAREC=arm
+         HAVE_NEON = 1
+      endif
+      LDFLAGS += -static-libgcc -static-libstdc++
+   endif
+
+   # Classic Platforms ####################
+   # Platform affix = classic_<ISA>_<µARCH>
+   # Help at https://modmyclassic.com/comp
+
+   # (armv7 a7, hard point, neon based) ### 
+   # NESC, SNESC, C64 mini 
+   ifneq (,$(findstring classic_armv7_a7, $(platform)))
+      GLES = 1
+      HAVE_NEON = 1
+      WITH_DYNAREC=arm
+      ASFLAGS += -D__ARM_NEON__ -marm -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+      CPUFLAGS += -DNO_ASM -DARM -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE -DARM_FIX -DCLASSIC
+      CPUFLAGS += -Ofast \
+      -flto=4 -fwhole-program -fuse-linker-plugin \
+      -fdata-sections -ffunction-sections -Wl,--gc-sections \
+      -fno-stack-protector -fno-ident -fomit-frame-pointer \
+      -falign-functions=1 -falign-jumps=1 -falign-loops=1 \
+      -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-unroll-loops \
+      -fmerge-all-constants -fno-math-errno \
+      -marm -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+      LDFLAGS += -marm -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+      CPUFLAGS += -march=armv7ve
+      # If gcc is 5.0 or later
+      ifeq ($(shell echo `$(CC) -dumpversion` ">= 5" | bc -l), 1)
+         LDFLAGS += -static-libgcc -static-libstdc++
+      endif
+   endif  
+   
+   
+   # (armv8 a35, hard point, neon based) ###
+   # PlayStation Classic
+   ifneq (,$(findstring classic_armv8_a35, $(platform)))
+      GLES = 1
+      HAVE_NEON = 1
+      WITH_DYNAREC=arm
+      ASFLAGS += -D__ARM_NEON__ -marm -mtune=cortex-a35 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+      CPUFLAGS += -DNO_ASM -DARM -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE -DARM_FIX -DCLASSIC
+      CPUFLAGS += -Ofast \
+      -flto -fwhole-program -fuse-linker-plugin \
+      -fdata-sections -ffunction-sections -Wl,--gc-sections \
+      -fno-stack-protector -fno-ident -fomit-frame-pointer \
+      -falign-functions=1 -falign-jumps=1 -falign-loops=1 \
+      -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-unroll-loops \
+      -fmerge-all-constants -fno-math-errno \
+      -marm -mtune=cortex-a35 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+      LDFLAGS += -marm -mtune=cortex-a35 -mfpu=neon-fp-armv8 -mfloat-abi=hard
+      CPUFLAGS += -march=armv8-a
+      LDFLAGS += -static-libgcc -static-libstdc++
+   endif
+
+   #######################################
+   # Generic ARMV8 - cross - No GL 
+   ifneq (,$(findstring armv8,$(platform)))
+      CC = aarch64-linux-gnu-gcc
+      CXX = aarch64-linux-gnu-g++
+      CPUFLAGS += -DNO_ASM -DARM -DARM_ASM -DDONT_WANT_ARM_OPTIMIZATIONS -DARM_FIX -DCLASSIC -DARM64
+      LDFLAGS += -static-libgcc -static-libstdc++
+      GLES = 0
+      HAVE_NEON = 0
+      WITH_DYNAREC=aarch64
+      ifneq (,$(findstring neon,$(platform)))
+         CPUFLAGS += -D__NEON_OPT -mfpu=neon
+         HAVE_NEON = 1
+      endif
+   endif
+
+   #######################################
+   # Generic ARM
+   ifneq (,$(findstring armv,$(platform)))
+      CPUFLAGS += -DNO_ASM -DARM -D__arm__ -DARM_ASM -DNOSSE -DARM_FIX
+      WITH_DYNAREC=arm
+      ifneq (,$(findstring neon,$(platform)))
+         CPUFLAGS += -D__NEON_OPT -mfpu=neon
+         HAVE_NEON = 1
+      endif
+      PLATFORM_EXT := unix
+   endif
+
+# i.MX6
+else ifneq (,$(findstring imx6,$(platform)))
+   TARGET := $(TARGET_NAME)_libretro.so
+   LDFLAGS += -shared -Wl,--version-script=$(LIBRETRO_DIR)/link.T
+   fpic = -fPIC
+   GLES = 1
+   CPUFLAGS += -DNO_ASM
+   PLATFORM_EXT := unix
+   WITH_DYNAREC=arm
+   HAVE_NEON=1
+
+# OS X
+else ifneq (,$(findstring osx,$(platform)))
+   TARGET := $(TARGET_NAME)_libretro.dylib
+   LDFLAGS += -dynamiclib
+   MINVERSION := -mmacosx-version-min=10.7
+   OSXVER = `sw_vers -productVersion | cut -d. -f 2`
+   OSX_LT_MAVERICKS = `(( $(OSXVER) <= 9)) && echo "YES"`
+   LDFLAGS += $(MINVERSION)
+   LDFLAGS += -stdlib=libc++
+   fpic = -fPIC
+
+   PLATCFLAGS += -D__MACOSX__ -DOSX
+   PLATFORM_EXT := unix
+   PLATCFLAGS += -DHAVE_POSIX_MEMALIGN
+
+	COREFLAGS += -DOS_MAC_OS_X -stdlib=libc++
+
+   # Target Dynarec
+   ifeq ($(ARCH), $(filter $(ARCH), ppc))
+      WITH_DYNAREC =
+   endif
+
+   # Native Apple Silicon: uname -m reports arm64, the dynarec backend is
+   # the same aarch64 one the cross-compile path uses. NO_ASM must stay
+   # off - it compiles out dynarec_setup_code() in r4300.c, which would
+   # leave the dynarec selectable but broken.
+   ifeq ($(arch), arm)
+		CFLAGS +=   -DDONT_WANT_ARM_OPTIMIZATIONS -D__NEON_OPT -DARM_FIX
+		CPPFLAGS += -DDONT_WANT_ARM_OPTIMIZATIONS -D__NEON_OPT -DARM_FIX
+		CXXFLAGS += -DDONT_WANT_ARM_OPTIMIZATIONS -D__NEON_OPT -DARM_FIX
+		HAVE_NEON=1
+		MINVERSION := -mmacosx-version-min=11.0
+		WITH_DYNAREC = aarch64
+   endif
+
+   ifeq ($(CROSS_COMPILE),1)
+		ifneq (,$(findstring arm,$(LIBRETRO_APPLE_PLATFORM)))
+			CFLAGS +=   -DDONT_WANT_ARM_OPTIMIZATIONS -D__NEON_OPT -DARM_FIX
+			CPPFLAGS += -DDONT_WANT_ARM_OPTIMIZATIONS -D__NEON_OPT -DARM_FIX
+			CXXFLAGS += -DDONT_WANT_ARM_OPTIMIZATIONS -D__NEON_OPT -DARM_FIX
+			CPUFLAGS += -fno-stack-protector -fomit-frame-pointer
+			HAVE_NEON=1
+			MINVERSION := -mmacosx-version-min=11.0
+			WITH_DYNAREC = aarch64
+		endif
+
+		TARGET_RULE   = -target $(LIBRETRO_APPLE_PLATFORM) -isysroot $(LIBRETRO_APPLE_ISYSROOT)
+		CFLAGS   += $(TARGET_RULE)
+		CPPFLAGS += $(TARGET_RULE)
+		CXXFLAGS += $(TARGET_RULE)
+		LDFLAGS  += $(TARGET_RULE)
+   endif
+
+	CFLAGS  += $(ARCHFLAGS)
+	CXXFLAGS  += $(ARCHFLAGS)
+	LDFLAGS += $(ARCHFLAGS)
+	CC_AS = perl ./tools/gas-preprocessor-new.pl -arch arm64 -- $(CC)
+	# The .S linkage object (linkage_aarch64.S) is assembled via CC_AS, which
+	# otherwise inherits no deployment target and gets stamped with the SDK
+	# default (e.g. macOS 13.0), producing a "built for newer macOS version than
+	# being linked" warning against the 11.0 link. Pass MINVERSION through
+	# ASFLAGS so the object's minimum-OS load command matches the rest of the build.
+	ASFLAGS += $(MINVERSION)
+	# Same reasoning for the C/C++ objects: with -flto -fwhole-program the final
+	# code generation happens at link time from the bitcode, and its deployment
+	# target comes from the per-TU compile flags, not LDFLAGS. Without MINVERSION
+	# in CFLAGS/CXXFLAGS the LTO intermediate (/tmp/lto.o) defaults to the SDK
+	# version and triggers the same "newer macOS version" warning. MINVERSION is
+	# final here (after the arch reassignment above), so add it to both.
+	CFLAGS   += $(MINVERSION)
+	CXXFLAGS += $(MINVERSION)
+# iOS
+else ifneq (,$(findstring ios,$(platform)))
+   ifeq ($(IOSSDK),)
+      IOSSDK := $(shell xcodebuild -version -sdk iphoneos Path)
+   endif
+
+   TARGET := $(TARGET_NAME)_libretro_ios.dylib
+   DEFINES += -DIOS
+   HAVE_OPENGL=0
+   WITH_DYNAREC=
+   PLATFORM_EXT := unix
+   MINVERSION :=
+
+   HAVE_PARALLEL=0
+   PLATCFLAGS += -DHAVE_POSIX_MEMALIGN -DNO_ASM
+   PLATCFLAGS += -DIOS
+   CPUFLAGS += -DNO_ASM  -DARM -D__arm__ -DARM_ASM -D__NEON_OPT
+   LDFLAGS += -dynamiclib
+
+   fpic = -fPIC
+   ifeq ($(platform),ios-arm64)
+      CC = clang -arch arm64 -isysroot $(IOSSDK)
+      CXX = clang++ -arch arm64 -isysroot $(IOSSDK)
+      CFLAGS += -DDONT_WANT_ARM_OPTIMIZATIONS
+      CXXFLAGS += -Wc++11-extensions -std=c++11 -stdlib=libc++ -Wc++11-long-long
+      HAVE_NEON=0
+   else
+      # -mcpu=cortex-a8 is only valid for a pure 32-bit armv7 invocation.
+      # clang rejects it when arm64 is also in the target arch list (e.g. the
+      # fat armv7+arm64 ios10 super-script build, which sets both -arch flags
+      # in CC), so only emit it when arm64 is not among the target arches.
+      CPUFLAGS += -mfpu=neon -mfloat-abi=softfp
+      ifeq (,$(findstring arm64,$(CC)))
+         CPUFLAGS += -marm -mcpu=cortex-a8
+         CC = clang -arch armv7 -isysroot $(IOSSDK)
+         CXX = clang++ -arch armv7 -isysroot $(IOSSDK)
+      endif
+      PLATCFLAGS += -marm
+      HAVE_NEON=1
+   endif
+   CC_AS = perl ./tools/gas-preprocessor.pl $(CC)
+ifeq ($(platform),$(filter $(platform),ios9 ios-arm64))
+      MINVERSION = -miphoneos-version-min=8.0
+   else
+      MINVERSION = -miphoneos-version-min=5.0
+   endif
+   PLATCFLAGS += $(MINVERSION)
+   LDFLAGS += $(MINVERSION)
+
+else ifeq ($(platform), tvos-arm64)
+   ifeq ($(IOSSDK),)
+      IOSSDK := $(shell xcodebuild -version -sdk appletvos Path)
+   endif
+
+   TARGET := $(TARGET_NAME)_libretro_tvos.dylib
+   DEFINES += -DIOS
+   WITH_DYNAREC=
+   PLATFORM_EXT := unix
+   MINVERSION :=
+
+   HAVE_PARALLEL=0
+   PLATCFLAGS += -DHAVE_POSIX_MEMALIGN -DNO_ASM
+   PLATCFLAGS += -DIOS -marm
+   CPUFLAGS += -DNO_ASM  -DARM -D__arm__ -DARM_ASM -D__NEON_OPT
+   LDFLAGS += -dynamiclib
+
+   fpic = -fPIC
+   HAVE_OPENGL=0
+      CC = cc -arch arm64 -isysroot $(IOSSDK)
+      CXX = c++ -arch arm64 -isysroot $(IOSSDK)
+      CFLAGS += -DDONT_WANT_ARM_OPTIMIZATIONS
+      FORCE_GLES=1
+      CXXFLAGS += -Wc++11-extensions -std=c++11 -stdlib=libc++ -Wc++11-long-long
+      CPUFLAGS += -marm -mfpu=neon -mfloat-abi=softfp
+      HAVE_NEON=0
+   CC_AS = perl ./tools/gas-preprocessor.pl $(CC)
+   MINVERSION = -miphoneos-version-min=8.0
+   PLATCFLAGS += $(MINVERSION)
+
+# Theos iOS
+else ifneq (,$(findstring theos_ios,$(platform)))
+   DEPLOYMENT_IOSVERSION = 5.0
+   TARGET = iphone:latest:$(DEPLOYMENT_IOSVERSION)
+   ARCHS = armv7
+   TARGET_IPHONEOS_DEPLOYMENT_VERSION=$(DEPLOYMENT_IOSVERSION)
+   THEOS_BUILD_DIR := objs
+   include $(THEOS)/makefiles/common.mk
+
+   LIBRARY_NAME = $(TARGET_NAME)_libretro_ios
+   DEFINES += -DIOS
+   HAVE_OPENGL=0
+   WITH_DYNAREC=arm
+
+   PLATCFLAGS += -DHAVE_POSIX_MEMALIGN -DNO_ASM
+   PLATCFLAGS += -DIOS -marm
+   CPUFLAGS += -DNO_ASM  -DARM -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE
+   HAVE_NEON=1
+
+
+# Android
+else ifneq (,$(findstring android,$(platform)))
+   fpic = -fPIC
+   TARGET := $(TARGET_NAME)_libretro_android.so
+   LDFLAGS += -shared -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,--no-undefined -Wl,--warn-common
+
+   CC = arm-linux-androideabi-gcc
+   CXX = arm-linux-androideabi-g++
+   WITH_DYNAREC=arm
+   GLES = 1
+   PLATCFLAGS += -DANDROID
+   CPUCFLAGS  += -DNO_ASM
+   HAVE_NEON = 1
+   CPUFLAGS += -marm -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=softfp -D__arm__ -DARM_ASM -D__NEON_OPT
+   CFLAGS += -DANDROID
+
+   PLATFORM_EXT := unix
+
+# QNX
+else ifeq ($(platform), qnx)
+   fpic = -fPIC
+   TARGET := $(TARGET_NAME)_libretro_$(platform).so
+   LDFLAGS += -shared -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,--no-undefined -Wl,--warn-common
+
+   CC = qcc -Vgcc_ntoarmv7le
+   CC_AS = qcc -Vgcc_ntoarmv7le
+   CXX = QCC -Vgcc_ntoarmv7le
+   AR = QCC -Vgcc_ntoarmv7le
+   WITH_DYNAREC=arm
+   GLES = 1
+   PLATCFLAGS += -DNO_ASM -D__BLACKBERRY_QNX__
+   CPUFLAGS += -DNOSSE
+   HAVE_NEON = 1
+   CPUFLAGS += -marm -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=softfp -D__arm__ -DARM_ASM -D__NEON_OPT -DNOSSE
+   CFLAGS += -D__QNX__
+
+   PLATFORM_EXT := unix
+
+# emscripten
+else ifeq ($(platform), emscripten)
+   TARGET := $(TARGET_NAME)_libretro_$(platform).bc
+   GLES := 1
+   WITH_DYNAREC :=
+
+   HAVE_PARALLEL = 0
+   HAVE_THR_AL = 1
+   CPUFLAGS += -DNOSSE -DEMSCRIPTEN -DNO_ASM
+
+   WITH_DYNAREC =
+   CC = emcc
+   CXX = em++
+   HAVE_NEON = 0
+   PLATFORM_EXT := unix
+   STATIC_LINKING = 1
+   SOURCES_C += $(CORE_DIR)/src/device/r4300/empty_dynarec.c
+
+# PlayStation Vita
+else ifneq (,$(findstring vita,$(platform)))
+   TARGET:= $(TARGET_NAME)_libretro_$(platform).a
+   CPUFLAGS += -DNO_ASM  -DARM -D__arm__ -DARM_ASM -D__NEON_OPT
+   CPUFLAGS += -w -mthumb -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -D__arm__ -DARM_ASM -D__NEON_OPT -g
+   HAVE_NEON = 1
+
+   PREFIX = arm-vita-eabi
+   CC = $(PREFIX)-gcc
+   CXX = $(PREFIX)-g++
+   AR  = $(PREFIX)-ar
+   WITH_DYNAREC = arm
+   DYNAREC_USED = 0
+   GLES = 0
+   HAVE_OPENGL = 0
+   PLATCFLAGS += -DVITA
+   CPUCFLAGS += -DNO_ASM
+   CFLAGS += -DVITA -lm
+   VITA = 1
+   HAVE_PARALLEL=0
+   SOURCES_C += $(CORE_DIR)/src/device/r4300/empty_dynarec.c
+
+   PLATFORM_EXT := unix
+   STATIC_LINKING=1
+
+# Windows MSVC 2017 all architectures
+else ifneq (,$(findstring windows_msvc2017,$(platform)))
+
+	PlatformSuffix = $(subst windows_msvc2017_,,$(platform))
+	ifneq (,$(findstring desktop,$(PlatformSuffix)))
+		WinPartition = desktop
+        MSVC2017CompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP
+		LDFLAGS += -MANIFEST -LTCG:incremental -NXCOMPAT -DYNAMICBASE -DEBUG -OPT:REF -INCREMENTAL:NO -SUBSYSTEM:WINDOWS -MANIFESTUAC:"level='asInvoker' uiAccess='false'" -OPT:ICF -ERRORREPORT:PROMPT -NOLOGO -TLBID:1
+		LIBS += kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib
+	else ifneq (,$(findstring uwp,$(PlatformSuffix)))
+		WinPartition = uwp
+		MSVC2017CompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_APP -D_WINDLL -D_UNICODE -DUNICODE -D__WRL_NO_DEFAULT_LIB__ -EHsc
+		LDFLAGS += -APPCONTAINER -NXCOMPAT -DYNAMICBASE -MANIFEST:NO -LTCG -OPT:REF -SUBSYSTEM:CONSOLE -MANIFESTUAC:NO -OPT:ICF -ERRORREPORT:PROMPT -NOLOGO -TLBID:1 -DEBUG:FULL -WINMD:NO
+		LIBS += WindowsApp.lib
+
+        HAVE_OPENGL = 0
+	endif
+
+    WITH_DYNAREC :=
+    SOURCES_C += $(CORE_DIR)/src/device/r4300/empty_dynarec.c
+
+	CFLAGS += $(MSVC2017CompileFlags)
+	CXXFLAGS += $(MSVC2017CompileFlags)
+
+	TargetArchMoniker = $(subst $(WinPartition)_,,$(PlatformSuffix))
+
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+	ASFLAGS += -f win64
+	HAVE_PARALLEL=0
+	HAVE_PARALLEL_RSP=0
+	HAVE_THR_AL=1
+
+	reg_query = $(call filter_out2,$(subst $2,,$(shell reg query "$2" -v "$1" 2>nul)))
+	fix_path = $(subst $(SPACE),\ ,$(subst \,/,$1))
+
+	ProgramFiles86w := $(shell cmd //c "echo %PROGRAMFILES(x86)%")
+	ProgramFiles86 := $(shell cygpath "$(ProgramFiles86w)")
+
+	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
+	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
+	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
+	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
+	WindowsSdkDir := $(WindowsSdkDir)
+
+	WindowsSDKVersion ?= $(firstword $(foreach folder,$(subst $(subst \,/,$(WindowsSdkDir)Include/),,$(wildcard $(call fix_path,$(WindowsSdkDir)Include\*))),$(if $(wildcard $(call fix_path,$(WindowsSdkDir)Include/$(folder)/um/Windows.h)),$(folder),)))$(BACKSLASH)
+	WindowsSDKVersion := $(WindowsSDKVersion)
+
+	VsInstallBuildTools = $(ProgramFiles86)/Microsoft Visual Studio/2017/BuildTools
+	VsInstallEnterprise = $(ProgramFiles86)/Microsoft Visual Studio/2017/Enterprise
+	VsInstallProfessional = $(ProgramFiles86)/Microsoft Visual Studio/2017/Professional
+	VsInstallCommunity = $(ProgramFiles86)/Microsoft Visual Studio/2017/Community
+
+	VsInstallRoot ?= $(shell if [ -d "$(VsInstallBuildTools)" ]; then echo "$(VsInstallBuildTools)"; fi)
+	ifeq ($(VsInstallRoot), )
+		VsInstallRoot = $(shell if [ -d "$(VsInstallEnterprise)" ]; then echo "$(VsInstallEnterprise)"; fi)
+	endif
+	ifeq ($(VsInstallRoot), )
+		VsInstallRoot = $(shell if [ -d "$(VsInstallProfessional)" ]; then echo "$(VsInstallProfessional)"; fi)
+	endif
+	ifeq ($(VsInstallRoot), )
+		VsInstallRoot = $(shell if [ -d "$(VsInstallCommunity)" ]; then echo "$(VsInstallCommunity)"; fi)
+	endif
+	VsInstallRoot := $(VsInstallRoot)
+
+	VcCompilerToolsVer := $(shell cat "$(VsInstallRoot)/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" | grep -o '[0-9\.]*')
+	VcCompilerToolsDir := $(VsInstallRoot)/VC/Tools/MSVC/$(VcCompilerToolsVer)
+
+	WindowsSDKSharedIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\shared")
+	WindowsSDKUCRTIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\ucrt")
+	WindowsSDKUMIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\um")
+	WindowsSDKUCRTLibDir := $(shell cygpath -w "$(WindowsSdkDir)\Lib\$(WindowsSDKVersion)\ucrt\$(TargetArchMoniker)")
+	WindowsSDKUMLibDir := $(shell cygpath -w "$(WindowsSdkDir)\Lib\$(WindowsSDKVersion)\um\$(TargetArchMoniker)")
+
+	# For some reason the HostX86 compiler doesn't like compiling for x64
+	# ("no such file" opening a shared library), and vice-versa.
+	# Work around it for now by using the strictly x86 compiler for x86, and x64 for x64.
+	# NOTE: What about ARM?
+	ifneq (,$(findstring x64,$(TargetArchMoniker)))
+		VCCompilerToolsBinDir := $(VcCompilerToolsDir)\bin\HostX64
+		LDFLAGS += -MACHINE:X64
+	else
+		VCCompilerToolsBinDir := $(VcCompilerToolsDir)\bin\HostX86
+		LDFLAGS += -MACHINE:X86
+	endif
+
+	PATH := $(shell IFS=$$'\n'; cygpath "$(VCCompilerToolsBinDir)/$(TargetArchMoniker)"):$(PATH)
+	PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VsInstallRoot)/Common7/IDE")
+	INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VcCompilerToolsDir)/include")
+	LIB := $(shell IFS=$$'\n'; cygpath -w "$(VcCompilerToolsDir)/lib/$(TargetArchMoniker)")
+	ifneq (,$(findstring uwp,$(PlatformSuffix)))
+		LIB := $(shell IFS=$$'\n'; cygpath -w "$(LIB)/store")
+	endif
+    
+	export INCLUDE := $(INCLUDE);$(WindowsSDKSharedIncludeDir);$(WindowsSDKUCRTIncludeDir);$(WindowsSDKUMIncludeDir)
+	export LIB := $(LIB);$(WindowsSDKUCRTLibDir);$(WindowsSDKUMLibDir)
+	TARGET := $(TARGET_NAME)_libretro.dll
+	PSS_STYLE :=2
+	LDFLAGS += -DLL
+
+# Windows MSVC 2013 x86
+else ifeq ($(platform), windows_msvc2013_x86)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS120COMNTOOLS)../../VC/bin"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS120COMNTOOLS)../IDE")
+LIB := $(shell IFS=$$'\n'; cygpath -w "$(VS120COMNTOOLS)../../VC/lib")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS120COMNTOOLS)../../VC/include")
+
+WindowsSdkDir := $(shell reg query "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -v "KitsRoot81" | grep -o '[A-Z]:\\.*')
+
+WindowsSdkDirInc := $(WindowsSdkDir)Include
+
+INCFLAGS_PLATFORM = -I"$(WindowsSdkDirInc)\um" -I"$(WindowsSdkDirInc)\shared"
+export INCLUDE := $(INCLUDE)
+export LIB := $(LIB);$(WindowsSdkDir)\Lib;$(WindowsSdkDir)\Lib\winv6.3\um\x86
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+ASFLAGS += -f win32
+LDFLAGS += -DLL -MACHINE:X86
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+WITH_DYNAREC=x86
+
+# Windows MSVC 2013 x64
+else ifeq ($(platform), windows_msvc2013_x64)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS120COMNTOOLS)../../VC/bin/amd64"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS120COMNTOOLS)../IDE")
+LIB := $(shell IFS=$$'\n'; cygpath -w "$(VS120COMNTOOLS)../../VC/lib/amd64")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS120COMNTOOLS)../../VC/include")
+
+WindowsSdkDir := $(shell reg query "HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -v "KitsRoot81" | grep -o '[A-Z]:\\.*')
+
+WindowsSdkDirInc := $(WindowsSdkDir)Include
+
+INCFLAGS_PLATFORM = -I"$(WindowsSdkDirInc)\um" -I"$(WindowsSdkDirInc)\shared"
+export INCLUDE := $(INCLUDE)
+export LIB := $(LIB);$(WindowsSdkDir)\Lib;$(WindowsSdkDir)\Lib\winv6.3\um\x64
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+ASFLAGS += -f win64
+LDFLAGS += -DLL -MACHINE:X64
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+
+# Windows MSVC 2015 x64
+else ifeq ($(platform), windows_msvc2015_x64)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS140COMNTOOLS)../../VC/bin/amd64"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS140COMNTOOLS)../IDE")
+LIB := $(shell IFS=$$'\n'; cygpath -w "$(VS140COMNTOOLS)../../VC/lib/amd64")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS140COMNTOOLS)../../VC/include")
+ASFLAGS += -f win64
+
+reg_query = $(call filter_out2,$(subst $2,,$(shell reg query "$2" -v "$1" 2>nul)))
+fix_path = $(subst $(SPACE),\ ,$(subst \,/,$1))
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir := $(WindowsSdkDir)
+
+WindowsSDKVersion ?= $(firstword $(foreach folder,$(subst $(subst \,/,$(WindowsSdkDir)Include/),,$(wildcard $(call fix_path,$(WindowsSdkDir)Include\*))),$(if $(wildcard $(call fix_path,$(WindowsSdkDir)Include/$(folder)/um/Windows.h)),$(folder),)))$(BACKSLASH)
+WindowsSDKVersion := $(WindowsSDKVersion)
+
+export INCLUDE := $(INCLUDE);$(VCINSTALLDIR)INCLUDE;$(VCINSTALLDIR)ATLMFC\INCLUDE;$(WindowsSdkDir)include\$(WindowsSDKVersion)ucrt;$(WindowsSdkDir)include\$(WindowsSDKVersion)shared;$(WindowsSdkDir)include\$(WindowsSDKVersion)um
+export LIB := $(LIB);$(VCINSTALLDIR)LIB\amd64;$(VCINSTALLDIR)ATLMFC\LIB\amd64;$(WindowsSdkDir)lib\$(WindowsSDKVersion)ucrt\x64;$(WindowsSdkDir)lib\$(WindowsSDKVersion)um\x64
+
+INCFLAGS_PLATFORM = -I"$(WindowsSDKVersion)um" -I"$(WindowsSDKVersion)shared"
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+LDFLAGS += -DLL -MACHINE:X64
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+
+# Windows MSVC 2015 x86
+else ifeq ($(platform), windows_msvc2015_x86)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS140COMNTOOLS)../../VC/bin"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS140COMNTOOLS)../IDE")
+LIB := $(shell IFS=$$'\n'; cygpath -w "$(VS140COMNTOOLS)../../VC/lib")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS140COMNTOOLS)../../VC/include")
+ASFLAGS += -f win32
+
+reg_query = $(call filter_out2,$(subst $2,,$(shell reg query "$2" -v "$1" 2>nul)))
+fix_path = $(subst $(SPACE),\ ,$(subst \,/,$1))
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
+WindowsSdkDir := $(WindowsSdkDir)
+
+WindowsSDKVersion ?= $(firstword $(foreach folder,$(subst $(subst \,/,$(WindowsSdkDir)Include/),,$(wildcard $(call fix_path,$(WindowsSdkDir)Include\*))),$(if $(wildcard $(call fix_path,$(WindowsSdkDir)Include/$(folder)/um/Windows.h)),$(folder),)))$(BACKSLASH)
+WindowsSDKVersion := $(WindowsSDKVersion)
+
+export INCLUDE := $(INCLUDE);$(VCINSTALLDIR)INCLUDE;$(VCINSTALLDIR)ATLMFC\INCLUDE;$(WindowsSdkDir)include\$(WindowsSDKVersion)ucrt;$(WindowsSdkDir)include\$(WindowsSDKVersion)shared;$(WindowsSdkDir)include\$(WindowsSDKVersion)um
+export LIB := $(LIB);$(VCINSTALLDIR)LIB;$(VCINSTALLDIR)ATLMFC\LIB;$(WindowsSdkDir)lib\$(WindowsSDKVersion)ucrt\x86;$(WindowsSdkDir)lib\$(WindowsSDKVersion)um\x86
+
+INCFLAGS_PLATFORM = -I"$(WindowsSDKVersion)um" -I"$(WindowsSDKVersion)shared"
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+LDFLAGS += -DLL -MACHINE:X86
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+
+# Windows MSVC 2010 x64
+else ifeq ($(platform), windows_msvc2010_x64)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS100COMNTOOLS)../../VC/bin/amd64"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS100COMNTOOLS)../IDE")
+LIB := $(shell IFS=$$'\n'; cygpath "$(VS100COMNTOOLS)../../VC/lib/amd64")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS100COMNTOOLS)../../VC/include")
+
+WindowsSdkDir := $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.0A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')lib/x64
+WindowsSdkDir ?= $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.1A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')lib/x64
+
+WindowsSdkDirInc := $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.0A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')Include
+WindowsSdkDirInc ?= $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.1A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')Include
+
+
+INCFLAGS_PLATFORM = -I"$(WindowsSdkDirInc)"
+export INCLUDE := $(INCLUDE)
+export LIB := $(LIB);$(WindowsSdkDir)
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+ASFLAGS += -f win64
+LDFLAGS += -DLL -MACHINE:X64
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+
+# Windows MSVC 2010 x86
+else ifeq ($(platform), windows_msvc2010_x86)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS100COMNTOOLS)../../VC/bin"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS100COMNTOOLS)../IDE")
+LIB := $(shell IFS=$$'\n'; cygpath -w "$(VS100COMNTOOLS)../../VC/lib")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS100COMNTOOLS)../../VC/include")
+
+WindowsSdkDir := $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.0A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')lib
+WindowsSdkDir ?= $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.1A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')lib
+
+WindowsSdkDirInc := $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.0A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')Include
+WindowsSdkDirInc ?= $(shell reg query "HKLM\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v7.1A" -v "InstallationFolder" | grep -o '[A-Z]:\\.*')Include
+
+
+INCFLAGS_PLATFORM = -I"$(WindowsSdkDirInc)"
+export INCLUDE := $(INCLUDE)
+export LIB := $(LIB);$(WindowsSdkDir)
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+ASFLAGS += -f win32
+LDFLAGS += -DLL -MACHINE:X86
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+
+# Windows MSVC 2005 x86
+else ifeq ($(platform), windows_msvc2005_x86)
+	CC  = cl.exe
+	CXX = cl.exe
+	CC_AS = nasm.exe
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+	HAS_GCC := 0
+
+PATH := $(shell IFS=$$'\n'; cygpath "$(VS80COMNTOOLS)../../VC/bin"):$(PATH)
+PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VS80COMNTOOLS)../IDE")
+INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VS80COMNTOOLS)../../VC/include")
+LIB := $(shell IFS=$$'\n'; cygpath -w "$(VS80COMNTOOLS)../../VC/lib")
+BIN := $(shell IFS=$$'\n'; cygpath "$(VS80COMNTOOLS)../../VC/bin")
+
+WindowsSdkDir := $(INETSDK)
+
+export INCLUDE := $(INCLUDE);$(INETSDK)/Include;libretro-common/include/compat/msvc
+export LIB := $(LIB);$(WindowsSdkDir);$(INETSDK)/Lib
+TARGET := $(TARGET_NAME)_libretro.dll
+PSS_STYLE :=2
+ASFLAGS += -f win32
+LDFLAGS += -DLL -MACHINE:X86
+CFLAGS += -D_CRT_SECURE_NO_DEPRECATE
+LIBS =
+HAVE_PARALLEL=0
+HAVE_PARALLEL_RSP=0
+NOSSE=1
+
+# Windows
+else ifneq (,$(findstring win,$(platform)))
+   TARGET := $(TARGET_NAME)_libretro.dll
+   LDFLAGS += -shared -static-libgcc -static-libstdc++ -Wl,--version-script=$(LIBRETRO_DIR)/link.T -lwinmm -lgdi32
+   PLATFORM_EXT := win32
+   CC ?= gcc
+   CXX ?= g++
+   HAVE_THR_AL=1
+	COREFLAGS += -DOS_WINDOWS -DUNICODE
+
+#ifeq ($(WITH_DYNAREC), $(filter $(WITH_DYNAREC), x86_64 x64))
+#ifeq ($(HAVE_PARALLEL), 1)
+	#HAVE_PARALLEL_RSP=1
+   #CPUFLAGS += -D_POSIX_SOURCE
+#endif
+#endif
+
+endif
+
+ifneq ($(SANITIZER),)
+    CFLAGS   += -fsanitize=$(SANITIZER)
+    CXXFLAGS += -fsanitize=$(SANITIZER)
+    LDFLAGS  += -fsanitize=$(SANITIZER)
+endif
+
+ifeq ($(HAVE_OPENGL),0)
+	HAVE_GLIDE64=0
+	HAVE_GLN64=0
+	HAVE_GLIDEN64=0
+	HAVE_RICE=0
+endif
+
+# A GLES build compiles glsym_es2.c, which references the GLESv2 entry
+# points directly (the desktop glsym_gl.c resolves them at runtime), so
+# the library must be linked. Only the webOS block set GL_LIB, leaving
+# the generic unix/rpi/odroid GLES paths to fail at link with undefined
+# references to glUseProgram etc. Default it here for any GLES build
+# that has not already chosen a GL library.
+ifeq ($(GLES),1)
+   ifeq ($(GL_LIB),)
+      GL_LIB := -lGLESv2
+   endif
+endif
+
+# Ari64 new_dynarec on x86/x86_64: assembled with nasm. Enabled on the
+# desktop targets where the static code cache and linkage are wired up.
+NASM ?= nasm
+ifeq (,$(findstring msvc,$(platform)))
+ifeq ($(WITH_DYNAREC), $(filter $(WITH_DYNAREC), x86_64 x64))
+   ifneq (,$(findstring unix,$(platform)))
+      HAVE_ARI64_X64 = 1
+      NASMFLAGS = -f elf64
+   else ifneq (,$(findstring osx,$(platform)))
+      HAVE_ARI64_X64 = 1
+      NASMFLAGS = -f macho64 -DLEADING_UNDERSCORE
+   else ifneq (,$(findstring win,$(platform)))
+      HAVE_ARI64_X64 = 1
+      NASMFLAGS = -f win64 -DWIN64
+   endif
+endif
+ifeq ($(WITH_DYNAREC), x86)
+   # The 32-bit (i686) ari64 dynarec is not built: its win32 linkage is emitted
+   # without the leading-underscore symbol decoration the Win32 cdecl ABI
+   # requires (NASMFLAGS lacks -DLEADING_UNDERSCORE), so it does not link, and
+   # the path is otherwise unvalidated in this fork. Leave HAVE_ARI64_X86 off so
+   # i686 builds the interpreters only. Set HAVE_ARI64_X86=1 explicitly to opt in
+   # if/when the 32-bit linkage is fixed.
+   ifeq ($(HAVE_ARI64_X86), 1)
+      ifneq (,$(findstring unix,$(platform)))
+         NASMFLAGS = -f elf32 -DELF_TYPE
+      else ifneq (,$(findstring win,$(platform)))
+         NASMFLAGS = -f win32 -DLEADING_UNDERSCORE
+      endif
+      # The generated code and linkage only keep 4-byte stack alignment
+      # (the pre-SSE i386 ABI); have gcc realign in functions that spill
+      # SSE registers instead of assuming 16-byte incoming alignment.
+      CPUFLAGS += -mincoming-stack-boundary=2
+   endif
+endif
+endif
+
+include Makefile.common
+
+ifeq ($(HAVE_NEON), 1)
+   COREFLAGS += -DHAVE_NEON
+endif
+
+ifeq ($(PERF_TEST), 1)
+   COREFLAGS += -DPERF_TEST
+endif
+
+ifeq ($(HAVE_SHARED_CONTEXT), 1)
+   COREFLAGS += -DHAVE_SHARED_CONTEXT
+endif
+
+COREFLAGS += -D__LIBRETRO__ -DM64P_PLUGIN_API -DM64P_CORE_PROTOTYPES
+
+OBJOUT   = -o 
+LINKOUT  = -o 
+
+ifneq (,$(findstring msvc,$(platform)))
+	OBJOUT = -Fo
+	LINKOUT = -out:
+	LD = link.exe
+else
+	LD = $(CXX)
+endif
+
+ifeq ($(DEBUG), 1)
+   CPUOPTS += -DOPENGL_DEBUG
+
+   ifneq (,$(findstring msvc,$(platform)))
+      ifeq (,$(findstring msvc2005,$(platform)))
+      ifeq (,$(findstring msvc2010,$(platform)))
+				 # /FS was added in 2013
+         CPUOPTS += -FS
+      endif
+      endif
+
+      ifeq ($(STATIC_LINKING),1)
+      CPUOPTS += -Od -MTd -Zi
+      else
+      CPUOPTS += -Od -MDd -Zi
+      endif
+
+      LDFLAGS += -DEBUG
+   else
+      CPUOPTS += -O0 -g
+   endif
+else
+ifneq (,$(findstring msvc,$(platform)))
+   CPUOPTS += -O2
+else ifeq ($(platform), emscripten)
+   CPUOPTS += -O3
+else
+	CPUOPTS += -Ofast
+endif
+   CPUOPTS += -DNDEBUG
+ifneq ($(findstring Darwin,$(UNAME)),)
+   CPUOPTS += -flto
+else ifeq ($(findstring msvc,$(platform)),)
+ifneq ($(platform), emscripten)
+ifneq ($(shell $(CC) -v 2>&1 | grep -c "clang"),1)
+   CPUOPTS += -fipa-pta
+endif
+endif
+endif
+
+
+   ifneq (,$(findstring msvc,$(platform)))
+      ifeq (,$(findstring msvc2005,$(platform)))
+      ifeq (,$(findstring msvc2010,$(platform)))
+				 # /FS was added in 2013
+         CPUOPTS += -FS
+      endif
+      endif
+
+      ifeq ($(STATIC_LINKING),1)
+      CPUOPTS += -MT -Zi
+      else
+      CPUOPTS += -MD -Zi
+      endif
+
+      ifeq (,$(findstring msvc2017,$(platform)))
+      CPUOPTS += -EHsc -D_CRT_SECURE_NO_WARNINGS -D__LIBRETRO_WIN64__ -D__SSE2__ -DUNICODE -D_UNICODE -D_USRDLL -DWIN32 -D_WINDLL -D_WINDOWS -WX- -Zc:forScope -Zc:wchar_t -Zi -wd4996 -W0 -fp:precise -Gd -GL -Gm- -GS- -Gy -DMSVC2010_EXPORTS -Oi -Ot
+      LDFLAGS += -LTCG -DYNAMICBASE -ERRORREPORT:QUEUE -INCREMENTAL:NO -MANIFEST:NO -NXCOMPAT -OPT:ICF -OPT:REF -SUBSYSTEM:WINDOWS,"5.02" -TLBID:1 advapi32.lib comdlg32.lib gdi32.lib kernel32.lib odbc32.lib odbccp32.lib ole32.lib oleaut32.lib shell32.lib user32.lib uuid.lib winspool.lib
+      else
+      CPUOPTS += -EHsc -D_CRT_SECURE_NO_WARNINGS -D__LIBRETRO_WIN64__ -D__SSE2__ -DUNICODE -D_UNICODE -D_USRDLL -DWIN32 -D_WINDLL -D_WINDOWS -WX- -Zc:forScope -Zc:wchar_t -Zi -wd4996 -W0 -fp:precise -Gd -GL -Gm- -GS- -Gy -DMSVC2010_EXPORTS -Oi -Ot
+      LDFLAGS += -LTCG -DYNAMICBASE -ERRORREPORT:QUEUE -INCREMENTAL:NO -NXCOMPAT -OPT:ICF -OPT:REF
+      endif
+   endif
+endif
+
+WANT_CXX11=0
+
+ifeq ($(platform), qnx)
+   CFLAGS   += -Wp,-MMD
+   CXXFLAGS += -Wp,-MMD
+else
+ifeq ($(GLIDEN64),1)
+   CFLAGS   += -DGLIDEN64
+   CXXFLAGS += -DGLIDEN64
+   WANT_CXX11=1
+   CFLAGS   += -MMD
+   CXXFLAGS += -MMD
+else ifeq ($(HAVE_PARALLEL), 1)
+   WANT_CXX11=1
+   ifeq (,$(findstring msvc,$(platform)))
+     CFLAGS   += -MMD
+     CXXFLAGS += -MMD
+   else
+     CFLAGS   += -MT
+     CXXFLAGS += -MT
+   endif
+else ifeq (,$(findstring msvc,$(platform)))
+    CFLAGS   += -MMD
+    ifneq ($(platform),ios-arm64)
+        CXXFLAGS += -std=c++11 -MMD
+    endif
+endif
+ifeq ($(GLIDEN64ES),1)
+   CFLAGS   += -DGLIDEN64ES
+   CXXFLAGS += -DGLIDEN64ES
+endif
+endif
+
+ifeq ($(HAVE_THR_AL), 1)
+WANT_CXX11=1
+endif
+
+ifeq ($(WANT_CXX11),1)
+ifeq (,$(findstring msvc,$(platform)))
+CXXFLAGS += -std=c++11
+endif
+endif
+
+ifneq (,$(findstring msvc,$(platform)))
+CFLAGS += -DINLINE="_inline"
+CXXFLAGS += -DINLINE="_inline"
+else
+CFLAGS += -DINLINE="inline"
+CXXFLAGS += -DINLINE="inline"
+endif
+
+# Fix for GCC 10, make sure its added to all stages of the compiler
+ifneq ($(platform), emscripten)
+ifeq "$(shell expr `gcc -dumpversion` \>= 10)" "1"
+  CPUFLAGS += -fcommon
+endif
+CFLAGS += -fcommon
+endif
+
+# LTO
+ifeq ($(HAVE_LTCG),1)
+  CPUFLAGS += -flto
+endif
+
+ASFLAGS     := $(ASFLAGS) $(CFLAGS) $(CPUFLAGS)
+
+### Finalize ###
+OBJECTS     += $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o) $(SOURCES_ASM:.S=.o)
+OBJECTS     += $(SOURCES_NASM:.asm=.o)
+CXXFLAGS    += $(CPUOPTS) $(COREFLAGS) $(INCFLAGS) $(INCFLAGS_PLATFORM) $(fpic) $(PLATCFLAGS) $(CPUFLAGS) $(GLFLAGS) $(DYNAFLAGS)
+CFLAGS      += -fcommon $(CPUOPTS) $(COREFLAGS) $(INCFLAGS) $(INCFLAGS_PLATFORM) $(fpic) $(PLATCFLAGS) $(CPUFLAGS) $(GLFLAGS) $(DYNAFLAGS)
+
+ifeq ($(findstring Haiku,$(UNAME)),)
+ifeq (,$(findstring msvc,$(platform)))
+   LDFLAGS += -lm
+endif
+endif
+
+LDFLAGS    += $(fpic) $(CPUFLAGS)
+
+ifeq ($(platform), theos_ios)
+COMMON_FLAGS := -DIOS $(COMMON_DEFINES) $(INCFLAGS) $(INCFLAGS_PLATFORM) -I$(THEOS_INCLUDE_PATH) -Wno-error
+$(LIBRARY_NAME)_ASFLAGS += $(CFLAGS) $(COMMON_FLAGS)
+$(LIBRARY_NAME)_CFLAGS += $(CFLAGS) $(COMMON_FLAGS)
+$(LIBRARY_NAME)_CXXFLAGS += $(CXXFLAGS) $(COMMON_FLAGS)
+${LIBRARY_NAME}_FILES = $(SOURCES_CXX) $(SOURCES_C) $(SOURCES_ASM)
+${LIBRARY_NAME}_FRAMEWORKS = OpenGLES
+${LIBRARY_NAME}_LIBRARIES = z
+include $(THEOS_MAKE_PATH)/library.mk
+else
+all: $(TARGET)
+$(TARGET): $(OBJECTS)
+ifeq ($(STATIC_LINKING), 1)
+	$(AR) rcs $@ $(OBJECTS)
+else
+	$(LD) $(LINKOUT)$@ $(OBJECTS) $(LDFLAGS) $(GL_LIB) $(LIBS)
+endif
+
+
+%.o: %.S
+ifneq (,$(findstring msvc,$(platform)))
+	$(CC_AS) $(ASFLAGS) -o$@ $<
+else
+	$(CC_AS) $(ASFLAGS) -c $< $(OBJOUT)$@
+endif
+
+# nasm is invoked from the repo root, so it needs an include search path to
+# the directory holding the COMMITTED asm_defines_nasm.h that linkage_x64.asm
+# %includes (region 14). The -i flag only points nasm at that committed
+# header; nothing is generated at build time.
+%.o: %.asm
+	$(NASM) $(NASMFLAGS) -i$(ASM_DEFINES_DIR)/ -o $@ $<
+
+# region 14: the x64 asm_defines headers (x64/asm_defines_{nasm,gas}.h) are
+# GENERATED from the shared C struct (new_dynarec_hot_state) but COMMITTED to the
+# tree and treated as source. A normal build NEVER regenerates or touches them --
+# doing so on every compile needlessly rebuilt the assembly and (on Windows, via
+# line-ending conversion) left the working tree permanently dirty. They are also
+# marked -text in .gitattributes so git never rewrites their line endings.
+#
+# They only need refreshing when struct new_dynarec_hot_state (or struct
+# r4300_core's dynarec members) changes, via the explicit `make asm-defines-regen`
+# target below; the refreshed headers are then committed. Mechanism: asm_defines.c
+# bakes each struct offset into its object as a printable "@ASM_DEFINE ..." string;
+# strings|awk turns those into the headers. Adopted from mupen64plus-next.
+AWK     ?= awk
+STRINGS ?= strings
+TR      ?= tr
+ASM_DEFINES_DIR := $(CORE_DIR)/src/device/r4300/new_dynarec/x64
+
+.PHONY: asm-defines-regen
+asm-defines-regen:
+	$(CC) $(CFLAGS) $(DYNAFLAGS) -DNEW_DYNAREC=2 -c $(CORE_DIR)/src/asm_defines/asm_defines.c $(OBJOUT)$(CORE_DIR)/src/asm_defines/asm_defines.o
+	$(STRINGS) "$(CORE_DIR)/src/asm_defines/asm_defines.o" | $(TR) -d '\r' | $(AWK) -v dest_dir="$(ASM_DEFINES_DIR)" -f $(CORE_DIR)/tools/gen_asm_defines.awk
+	$(RM) $(CORE_DIR)/src/asm_defines/asm_defines.o
+
+mupen64plus-video-gliden64/src/%.o: mupen64plus-video-gliden64/src/%.c
+	$(CC) -I$(VIDEODIR_GLIDEN64)/src -I$(VIDEODIR_GLIDEN64)/src/osal $(CPPFLAGS) $(CFLAGS) -c $< $(OBJOUT)$@
+
+mupen64plus-video-gliden64/src/%.o: mupen64plus-video-gliden64/src/%.cpp
+	$(CXX) -I$(VIDEODIR_GLIDEN64)/src -I$(VIDEODIR_GLIDEN64)/src/osal $(CPPFLAGS) $(CXXFLAGS) -c $< $(OBJOUT)$@
+
+# Objects do not otherwise depend on the flags they were built with, so
+# toggling one of the diagnostic switches left every object stale and the
+# tool silently absent from the build - enabling HAVE_HLE_AUDIT and seeing
+# no captures appear, with nothing to say why.  Stamp the switch state and
+# have the objects depend on the stamp, so flipping one rebuilds what it
+# affects.
+BUILD_FLAG_STATE := HLE_AUDIT=$(HAVE_HLE_AUDIT) RSP_DMA_TRACE=$(HAVE_RSP_DMA_TRACE) RDP_DUMP=$(HAVE_RDP_DUMP)
+
+.build-flags: .FORCE
+	@if [ ! -f $@ ] || [ "`cat $@`" != "$(BUILD_FLAG_STATE)" ]; then \
+		echo "$(BUILD_FLAG_STATE)" > $@; \
+	fi
+
+.FORCE:
+.PHONY: .FORCE
+
+$(OBJECTS): .build-flags
+
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< $(OBJOUT)$@
+
+%.o: %.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< $(OBJOUT)$@
+
+clean: clean-tools
+	rm -f $(OBJECTS) $(TARGET) $(OBJECTS:.o=.d) .build-flags
+
+clean-tools:
+	rm -f $(ANGRYLION_TOOLS) lrhost$(EXE_EXT) lrhost_vk$(EXE_EXT) angrylion_replay$(EXE_EXT) $(ANGRYLION_CHECKS)
+
+# Angrylion benchmark and bit-exactness harnesses (tools/angrylion_*.c),
+# linked against the core's own angrylion objects: `make tools` after a
+# normal build, or on its own.
+ANGRYLION_TOOL_OBJS := $(VIDEODIR_ANGRYLION)/n64video.o \
+	$(VIDEODIR_ANGRYLION)/parallel_al.o \
+	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.o \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.o
+ANGRYLION_TOOLS := angrylion_bench$(EXE_EXT) angrylion_verify$(EXE_EXT) \
+	angrylion_pool_overhead$(EXE_EXT)
+
+angrylion_%$(EXE_EXT): tools/angrylion_%.c $(ANGRYLION_TOOL_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(VIDEODIR_ANGRYLION) -w $< $(ANGRYLION_TOOL_OBJS) -o $@ -lpthread -lm
+
+# Headless libretro host: loads the built core and a ROM, times retro_run.
+ifeq ($(EXE_EXT),.exe)
+LRHOST_LIBS :=
+else
+LRHOST_LIBS := -ldl
+endif
+lrhost$(EXE_EXT): tools/lrhost.c $(LIBRETRO_COMM_DIR)/features/features_cpu.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -w $< $(LIBRETRO_COMM_DIR)/features/features_cpu.o -o $@ $(LRHOST_LIBS) -lpthread -lm
+
+# The same host with a Vulkan HW context (headless; lavapipe works), for
+# running parallel-rdp: make lrhost_vk
+lrhost_vk$(EXE_EXT): tools/lrhost.c tools/lrhost_vulkan.h $(LIBRETRO_COMM_DIR)/features/features_cpu.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DLRHOST_VULKAN -I$(VIDEODIR_PARALLEL)/parallel-rdp/vulkan-headers/include -w $< $(LIBRETRO_COMM_DIR)/features/features_cpu.o -o $@ $(LRHOST_LIBS) -lpthread -lm
+
+angrylion_replay$(EXE_EXT): tools/angrylion_replay.c $(ANGRYLION_TOOL_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(VIDEODIR_ANGRYLION) -w $< $(ANGRYLION_TOOL_OBJS) -o $@ -lpthread -lm
+
+angrylion_vemit_test$(EXE_EXT): tools/angrylion_vemit_test.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(VIDEODIR_ANGRYLION)/n64video -w $< -o $@
+
+angrylion_gen_test$(EXE_EXT): tools/angrylion_gen_test.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(VIDEODIR_ANGRYLION)/n64video -w $< -o $@
+
+# HLE geometry frontend: the clipper's output must not depend on its
+# scratch vertices' previous contents.
+ANGRYLION_EMIT_OBJS := $(VIDEODIR_ANGRYLION)/rdp_emit_frontend.o \
+	$(VIDEODIR_ANGRYLION)/rdp_emit_bridge.o \
+	$(VIDEODIR_ANGRYLION)/rdp_emit_rsp.o \
+	$(VIDEODIR_ANGRYLION)/rdp_emit.o
+angrylion_clip_test$(EXE_EXT): tools/angrylion_clip_test.c $(ANGRYLION_EMIT_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(VIDEODIR_ANGRYLION) -w $< $(ANGRYLION_EMIT_OBJS) -o $@ -lm
+
+# Fast3D walker: the near clip plane comes from the microcode data segment.
+# The walkers reference the HLE activation glue for mid-list microcode
+# swaps; the test satisfies those entry points itself, so the glue and the
+# rasterizer stay out of the link.
+ANGRYLION_WALKER_OBJS := $(filter-out $(VIDEODIR_ANGRYLION)/rdp_emit_hle.o, \
+	$(patsubst %.c,%.o,$(wildcard $(VIDEODIR_ANGRYLION)/rdp_emit*.c))) \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.o \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.o
+angrylion_f3d_near_test$(EXE_EXT): tools/angrylion_f3d_near_test.c $(ANGRYLION_WALKER_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(VIDEODIR_ANGRYLION) -w $< $(ANGRYLION_WALKER_OBJS) -o $@ -lm
+
+ANGRYLION_CHECKS := angrylion_vemit_test$(EXE_EXT) angrylion_gen_test$(EXE_EXT) \
+	angrylion_clip_test$(EXE_EXT) angrylion_f3d_near_test$(EXE_EXT)
+
+tools: $(ANGRYLION_TOOLS) lrhost$(EXE_EXT) angrylion_replay$(EXE_EXT) $(ANGRYLION_CHECKS)
+
+# Run the angrylion self-tests: the vector emitter, the generated pipeline
+# stage, and the HLE geometry frontend's regression lanes.
+check-angrylion: $(ANGRYLION_CHECKS)
+	@set -e; for t in $(ANGRYLION_CHECKS); do echo "== $$t"; ./$$t; done
+
+.PHONY: clean clean-tools tools check-angrylion
+-include $(OBJECTS:.o=.d)
+
+# A header named by an existing .d file but since deleted is not an error:
+# the objects that included it just rebuild.
+%.h %.hpp:
+	@:
+endif
+
+print-%:
+	@echo '$*=$($*)'

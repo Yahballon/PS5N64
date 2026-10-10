@@ -1,0 +1,3171 @@
+static STRICTINLINE int32_t normalize_dzpix(int32_t sum)
+{
+    int count;
+    if (sum & 0xc000)
+        return 0x8000;
+    if (!(sum & 0xffff))
+        return 1;
+
+    if (sum == 1)
+        return 3;
+
+    for(count = 0x2000; count > 0; count >>= 1)
+    {
+        if (sum & count)
+            return (count << 1);
+    }
+    msg_error("normalize_dzpix: invalid codepath taken");
+    return 0;
+}
+
+static void replicate_for_copy(uint32_t wid, uint32_t* outbyte, uint32_t inshort, uint32_t nybbleoffset, uint32_t tilenum, uint32_t tformat, uint32_t tsize)
+{
+    uint32_t lownib, hinib;
+    switch(tsize)
+    {
+    case PIXEL_SIZE_4BIT:
+        lownib = (nybbleoffset ^ 3) << 2;
+        lownib = hinib = (inshort >> lownib) & 0xf;
+        if (tformat == FORMAT_CI)
+        {
+            *outbyte = (state[wid].tile[tilenum].palette << 4) | lownib;
+        }
+        else if (tformat == FORMAT_IA)
+        {
+            lownib = (lownib << 4) | lownib;
+            *outbyte = (lownib & 0xe0) | ((lownib & 0xe0) >> 3) | ((lownib & 0xc0) >> 6);
+        }
+        else
+            *outbyte = (lownib << 4) | lownib;
+        break;
+    case PIXEL_SIZE_8BIT:
+        hinib = ((nybbleoffset ^ 3) | 1) << 2;
+        if (tformat == FORMAT_IA)
+        {
+            lownib = (inshort >> hinib) & 0xf;
+            *outbyte = (lownib << 4) | lownib;
+        }
+        else
+        {
+            lownib = (inshort >> (hinib & ~4)) & 0xf;
+            hinib = (inshort >> hinib) & 0xf;
+            *outbyte = (hinib << 4) | lownib;
+        }
+        break;
+    default:
+        *outbyte = (inshort >> 8) & 0xff;
+        break;
+    }
+}
+
+static void fetch_qword_copy(uint32_t wid, uint32_t* hidword, uint32_t* lowdword, int32_t ssss, int32_t ssst, uint32_t tilenum)
+{
+    uint32_t shorta, shortb, shortc, shortd;
+    uint32_t sortshort[8];
+    int hibits[6];
+    int lowbits[6];
+    int32_t sss = ssss, sst = ssst, sss1 = 0, sss2 = 0, sss3 = 0;
+    int largetex = 0;
+
+    uint32_t tformat, tsize;
+    if (state[wid].other_modes.en_tlut)
+    {
+        tsize = PIXEL_SIZE_16BIT;
+        tformat = state[wid].other_modes.tlut_type ? FORMAT_IA : FORMAT_RGBA;
+    }
+    else
+    {
+        tsize = state[wid].tile[tilenum].size;
+        tformat = state[wid].tile[tilenum].format;
+    }
+
+    tc_pipeline_copy(wid, &sss, &sss1, &sss2, &sss3, &sst, tilenum);
+    read_tmem_copy(wid, sss, sss1, sss2, sss3, sst, tilenum, sortshort, hibits, lowbits);
+    largetex = (tformat == FORMAT_YUV || (tformat == FORMAT_RGBA && tsize == PIXEL_SIZE_32BIT));
+
+
+    if (state[wid].other_modes.en_tlut)
+    {
+        shorta = sortshort[4];
+        shortb = sortshort[5];
+        shortc = sortshort[6];
+        shortd = sortshort[7];
+    }
+    else if (largetex)
+    {
+        shorta = sortshort[0];
+        shortb = sortshort[1];
+        shortc = sortshort[2];
+        shortd = sortshort[3];
+    }
+    else
+    {
+        shorta = hibits[0] ? sortshort[4] : sortshort[0];
+        shortb = hibits[1] ? sortshort[5] : sortshort[1];
+        shortc = hibits[3] ? sortshort[6] : sortshort[2];
+        shortd = hibits[4] ? sortshort[7] : sortshort[3];
+    }
+
+    *lowdword = (shortc << 16) | shortd;
+
+    if (tsize == PIXEL_SIZE_16BIT)
+        *hidword = (shorta << 16) | shortb;
+    else
+    {
+        replicate_for_copy(wid, &shorta, shorta, lowbits[0] & 3, tilenum, tformat, tsize);
+        replicate_for_copy(wid, &shortb, shortb, lowbits[1] & 3, tilenum, tformat, tsize);
+        replicate_for_copy(wid, &shortc, shortc, lowbits[3] & 3, tilenum, tformat, tsize);
+        replicate_for_copy(wid, &shortd, shortd, lowbits[4] & 3, tilenum, tformat, tsize);
+        *hidword = (shorta << 24) | (shortb << 16) | (shortc << 8) | shortd;
+    }
+}
+
+static STRICTINLINE void rgba_correct(uint32_t wid, int offx, int offy, int r, int g, int b, int a, uint32_t cvg)
+{
+    int summand_r, summand_b, summand_g, summand_a;
+
+
+
+    if (cvg == 8)
+    {
+        r >>= 2;
+        g >>= 2;
+        b >>= 2;
+        a >>= 2;
+    }
+    else
+    {
+        summand_r = offx * state[wid].spans_cdr + offy * state[wid].spans_drdy;
+        summand_g = offx * state[wid].spans_cdg + offy * state[wid].spans_dgdy;
+        summand_b = offx * state[wid].spans_cdb + offy * state[wid].spans_dbdy;
+        summand_a = offx * state[wid].spans_cda + offy * state[wid].spans_dady;
+
+        r = ((r << 2) + summand_r) >> 4;
+        g = ((g << 2) + summand_g) >> 4;
+        b = ((b << 2) + summand_b) >> 4;
+        a = ((a << 2) + summand_a) >> 4;
+    }
+
+
+    state[wid].shade_color.r = special_9bit_clamptable[r & 0x1ff];
+    state[wid].shade_color.g = special_9bit_clamptable[g & 0x1ff];
+    state[wid].shade_color.b = special_9bit_clamptable[b & 0x1ff];
+    state[wid].shade_color.a = special_9bit_clamptable[a & 0x1ff];
+}
+
+static STRICTINLINE void z_correct(uint32_t wid, int offx, int offy, int* z, uint32_t cvg)
+{
+    int summand_z;
+    int sz = *z;
+    int zanded;
+
+
+
+    if (cvg == 8)
+        sz = sz >> 3;
+    else
+    {
+        summand_z = offx * state[wid].spans_cdz + offy * state[wid].spans_dzdy;
+
+        sz = ((sz << 2) + summand_z) >> 5;
+    }
+
+
+
+    zanded = (sz & 0x60000) >> 17;
+
+
+    switch (zanded)
+    {
+        case 0: *z = sz & 0x3ffff;                      break;
+        case 1: *z = sz & 0x3ffff;                      break;
+        case 2: *z = 0x3ffff;                           break;
+        case 3: *z = 0;                                 break;
+    }
+}
+
+/* The span can include the pixel at the scissor's right edge, one past
+ * the row: its coverage is zero, so it is never written, but reading the
+ * framebuffer or the depth buffer there touches the first pixel of the
+ * next row - which belongs to another worker. Skip those accesses. */
+#define PIXEL_IN_ROW(wid, i) \
+    (curpixel - (int)state[wid].fb_width * (i) >= 0 \
+     && curpixel - (int)state[wid].fb_width * (i) < (int)state[wid].fb_width)
+
+static void render_spans_1cycle_complete(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    struct spansigs sigs;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+
+    int prim_tile = tilenum;
+    int tile1 = tilenum;
+    int newtile = tilenum;
+    int news, newt;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc, dsinc, dtinc, dwinc;
+    int xinc;
+
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        dsinc = state[wid].spans_ds;
+        dtinc = state[wid].spans_dt;
+        dwinc = state[wid].spans_dw;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        dsinc = -state[wid].spans_ds;
+        dtinc = -state[wid].spans_dt;
+        dwinc = -state[wid].spans_dw;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+    int r, g, b, a, z, s, t, w;
+    int sr, sg, sb, sa, sz, ss, st, sw;
+    int xstart, xend, xendsc;
+    int sss = 0, sst = 0;
+    int32_t prelodfrac;
+    int curpixel = 0;
+    int x, length, scdiff, lodlength;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+        s = state[wid].span[i].s;
+        t = state[wid].span[i].t;
+        w = state[wid].span[i].w;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+
+
+        if (scdiff)
+        {
+
+
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+            s += (dsinc * scdiff);
+            t += (dtinc * scdiff);
+            w += (dwinc * scdiff);
+        }
+
+        lodlength = length + scdiff;
+
+        sigs.longspan = (lodlength > 7);
+        sigs.allvalid = !(state[wid].span[i].invalyscan[0] | state[wid].span[i].invalyscan[1]
+                        | state[wid].span[i].invalyscan[2] | state[wid].span[i].invalyscan[3]);
+        sigs.midspan = (lodlength == 7);
+        sigs.onelessthanmid = (lodlength == 6);
+
+        for (j = 0; j <= length; j++)
+        {
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+            ss = s >> 16;
+            st = t >> 16;
+            sw = w >> 16;
+            sz = (z >> 10) & 0x3fffff;
+
+
+            sigs.endspan = (j == length);
+            sigs.preendspan = (j == (length - 1));
+
+            lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+
+            get_texel1_1cycle(wid, &news, &newt, s, t, w, dsinc, dtinc, dwinc, i, &sigs);
+
+
+
+            if (j)
+            {
+                state[wid].texel0_color = state[wid].texel1_color;
+                state[wid].lod_frac = prelodfrac;
+            }
+            else
+            {
+                state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+
+                tclod_1cycle_current(wid, &sss, &sst, news, newt, s, t, w, dsinc, dtinc, dwinc, i, prim_tile, &tile1, &sigs);
+
+
+
+
+                texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+            }
+
+            sigs.nextspan = sigs.endspan;
+            sigs.endspan = sigs.preendspan;
+            sigs.preendspan = (j == (length - 2));
+
+            s += dsinc;
+            t += dtinc;
+            w += dwinc;
+
+            tclod_1cycle_next(wid, &news, &newt, s, t, w, dsinc, dtinc, dwinc, i, prim_tile, &newtile, &sigs, &prelodfrac);
+
+            texture_pipeline_cycle(wid, &state[wid].texel1_color, &state[wid].texel1_color, news, newt, newtile, 0);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            combiner_1cycle(wid, adith, &curpixel_cvg);
+            if (state[wid].dps.cap_on && state[wid].span[i].dps_cap)
+                dps_capture(wid, &state[wid].span[i], x, curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread1_ptr(wid, curpixel, &curpixel_memcvg);
+            if (PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg))
+            {
+                if (blender_1cycle(wid, &fir, &fig, &fib, cdith, blend_en, prewrap, curpixel_cvg, curpixel_cvbit))
+                {
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+
+
+
+
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+            z += dzinc;
+
+            x += xinc;
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+
+static void render_spans_1cycle_notexel1(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    if (al_key_census) al_key_note(wid);
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    struct spansigs sigs;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+
+    int prim_tile = tilenum;
+    int tile1 = tilenum;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc, dsinc, dtinc, dwinc;
+    int xinc;
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        dsinc = state[wid].spans_ds;
+        dtinc = state[wid].spans_dt;
+        dwinc = state[wid].spans_dw;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        dsinc = -state[wid].spans_ds;
+        dtinc = -state[wid].spans_dt;
+        dwinc = -state[wid].spans_dw;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+    int r, g, b, a, z, s, t, w;
+    int sr, sg, sb, sa, sz, ss, st, sw;
+    int xstart, xend, xendsc;
+    int sss = 0, sst = 0;
+    int curpixel = 0;
+    int x, length, scdiff, lodlength;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+        s = state[wid].span[i].s;
+        t = state[wid].span[i].t;
+        w = state[wid].span[i].w;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+        if (scdiff)
+        {
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+            s += (dsinc * scdiff);
+            t += (dtinc * scdiff);
+            w += (dwinc * scdiff);
+        }
+
+        lodlength = length + scdiff;
+
+        sigs.longspan = (lodlength > 7);
+        sigs.allvalid = !(state[wid].span[i].invalyscan[0] | state[wid].span[i].invalyscan[1]
+                        | state[wid].span[i].invalyscan[2] | state[wid].span[i].invalyscan[3]);
+        sigs.midspan = (lodlength == 7);
+
+        for (j = 0; j <= length; j++)
+        {
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+            ss = s >> 16;
+            st = t >> 16;
+            sw = w >> 16;
+            sz = (z >> 10) & 0x3fffff;
+
+
+
+            sigs.endspan = (j == length);
+            sigs.preendspan = (j == (length - 1));
+
+            /* A pixel with no coverage cannot be written: the blender
+             * takes coverage - or its bit, both zero here - as its gate
+             * and returns without a colour, so the texture fetch, the
+             * combiner and the framebuffer read that precede it are all
+             * discarded. Skip them. The dither noise is still drawn,
+             * because at dither level zero it advances a per-worker
+             * generator later pixels consume, and the attributes and
+             * addresses still step. These renderers carry no texel or
+             * memory colour between pixels, so nothing else about the
+             * skipped pixel is observable. */
+            /* ...except through the span buffer, which stages a pixel's
+             * word whatever its coverage: a span the test-mode model is
+             * capturing runs every pixel in full. */
+            if (!state[wid].cvgbuf[x]
+                && !(state[wid].dps.cap_on && state[wid].span[i].dps_cap))
+            {
+                if (!state[wid].other_modes.f.getditherlevel)
+                    get_dither_noise(wid, x, i, &cdith, &adith);
+                s += dsinc; t += dtinc; w += dwinc;
+                r += drinc; g += dginc; b += dbinc; a += dainc; z += dzinc;
+                x += xinc; curpixel += xinc; zbcur += xinc;
+                continue;
+            }
+
+            lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+            state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+            tclod_1cycle_current_simple(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, i, prim_tile, &tile1, &sigs);
+
+            texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            combiner_1cycle(wid, adith, &curpixel_cvg);
+            if (state[wid].dps.cap_on && state[wid].span[i].dps_cap)
+                dps_capture(wid, &state[wid].span[i], x, curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread1_ptr(wid, curpixel, &curpixel_memcvg);
+            if (PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg))
+            {
+                if (blender_1cycle(wid, &fir, &fig, &fib, cdith, blend_en, prewrap, curpixel_cvg, curpixel_cvbit))
+                {
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+
+            s += dsinc;
+            t += dtinc;
+            w += dwinc;
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+            z += dzinc;
+
+            x += xinc;
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+
+static void render_spans_1cycle_notex(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc;
+    int xinc;
+
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+    int r, g, b, a, z;
+    int sr, sg, sb, sa, sz;
+    int xstart, xend, xendsc;
+    int curpixel = 0;
+    int x, length, scdiff;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+        if (scdiff)
+        {
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+        }
+
+        for (j = 0; j <= length; j++)
+        {
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+            sz = (z >> 10) & 0x3fffff;
+
+            /* A pixel with no coverage cannot be written: the blender
+             * takes coverage - or its bit, both zero here - as its gate
+             * and returns without a colour, so the texture fetch, the
+             * combiner and the framebuffer read that precede it are all
+             * discarded. Skip them. The dither noise is still drawn,
+             * because at dither level zero it advances a per-worker
+             * generator later pixels consume, and the attributes and
+             * addresses still step. These renderers carry no texel or
+             * memory colour between pixels, so nothing else about the
+             * skipped pixel is observable. */
+            /* ...except through the span buffer, which stages a pixel's
+             * word whatever its coverage: a span the test-mode model is
+             * capturing runs every pixel in full. */
+            if (!state[wid].cvgbuf[x]
+                && !(state[wid].dps.cap_on && state[wid].span[i].dps_cap))
+            {
+                if (!state[wid].other_modes.f.getditherlevel)
+                    get_dither_noise(wid, x, i, &cdith, &adith);
+                r += drinc; g += dginc; b += dbinc; a += dainc; z += dzinc;
+                x += xinc; curpixel += xinc; zbcur += xinc;
+                continue;
+            }
+
+            lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            combiner_1cycle(wid, adith, &curpixel_cvg);
+            if (state[wid].dps.cap_on && state[wid].span[i].dps_cap)
+                dps_capture(wid, &state[wid].span[i], x, curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread1_ptr(wid, curpixel, &curpixel_memcvg);
+            if (PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg))
+            {
+                if (blender_1cycle(wid, &fir, &fig, &fib, cdith, blend_en, prewrap, curpixel_cvg, curpixel_cvbit))
+                {
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+            z += dzinc;
+
+            x += xinc;
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+static void render_spans_2cycle_complete(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    int32_t prelodfrac;
+    struct color nexttexel1_color;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+    uint32_t nextpixel_cvg;
+    uint32_t acalpha;
+
+
+
+    int tile2 = (tilenum + 1) & 7;
+    int tile1 = tilenum;
+    int prim_tile = tilenum;
+    int tile3 = tilenum;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc, dsinc, dtinc, dwinc;
+    int xinc;
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        dsinc = state[wid].spans_ds;
+        dtinc = state[wid].spans_dt;
+        dwinc = state[wid].spans_dw;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        dsinc = -state[wid].spans_ds;
+        dtinc = -state[wid].spans_dt;
+        dwinc = -state[wid].spans_dw;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+
+    int r, g, b, a, z, s, t, w;
+    int sr, sg, sb, sa, sz, ss, st, sw;
+    int xstart, xend, xendsc;
+    int sss = 0, sst = 0;
+    int curpixel = 0;
+    int wen;
+
+    int x, length, scdiff, lodlength;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+        s = state[wid].span[i].s;
+        t = state[wid].span[i].t;
+        w = state[wid].span[i].w;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+
+
+
+
+
+
+
+        if (scdiff)
+        {
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+            s += (dsinc * scdiff);
+            t += (dtinc * scdiff);
+            w += (dwinc * scdiff);
+        }
+
+        lodlength = length + scdiff;
+
+        for (j = 0; j <= length; j++)
+        {
+            sz = (z >> 10) & 0x3fffff;
+
+            if (!j)
+            {
+                sr = r >> 14;
+                sg = g >> 14;
+                sb = b >> 14;
+                sa = a >> 14;
+                ss = s >> 16;
+                st = t >> 16;
+                sw = w >> 16;
+
+                state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+                tclod_2cycle(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1, &tile2, &state[wid].lod_frac);
+
+                texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+                texture_pipeline_cycle(wid, &state[wid].texel1_color, &state[wid].texel0_color, sss, sst, tile2, 1);
+
+                lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+                rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+
+                if (state[wid].other_modes.f.getditherlevel < 2)
+                    get_dither_noise(wid, x, i, &cdith, &adith);
+
+                combiner_2cycle_cycle0(wid, adith, curpixel_cvg, &acalpha);
+            }
+
+
+
+            s += dsinc;
+            t += dtinc;
+            w += dwinc;
+
+            ss = s >> 16;
+            st = t >> 16;
+            sw = w >> 16;
+
+            state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+            if (j < length || !state[wid].span[i + 1].validline || lodlength < 3)
+            {
+                tclod_2cycle(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1, &tile2, &prelodfrac);
+
+                texture_pipeline_cycle(wid, &state[wid].nexttexel_color, &state[wid].nexttexel_color, sss, sst, tile1, 0);
+                texture_pipeline_cycle(wid, &nexttexel1_color, &state[wid].nexttexel_color, sss, sst, tile2, 1);
+            }
+            else
+            {
+                int sss2, sst2;
+
+                ss = state[wid].span[i + 1].s >> 16;
+                st = state[wid].span[i + 1].t >> 16;
+                sw = state[wid].span[i + 1].w >> 16;
+                state[wid].tcdiv_ptr(ss, st, sw, &sss2, &sst2);
+
+                tclod_2cycle_next(wid, &sss, &sst, &sss2, &sst2, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1, &tile3, &prelodfrac, i);
+
+                texture_pipeline_cycle(wid, &state[wid].nexttexel_color, &state[wid].nexttexel_color, sss, sst, tile1, 0);
+                texture_pipeline_cycle(wid, &nexttexel1_color, &state[wid].nexttexel_color, sss2, sst2, tile3, 0);
+            }
+
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            combiner_2cycle_cycle1(wid, adith, &curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread2_ptr(wid, curpixel, &curpixel_memcvg);
+
+
+            wen = PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg);
+
+            if (wen)
+                wen &= blender_2cycle_cycle0(wid, curpixel_cvg, curpixel_cvbit);
+            else
+                state[wid].memory_color = state[wid].pre_memory_color;
+
+
+
+
+
+
+            x += xinc;
+
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+
+
+
+
+            lookup_cvmask_derivatives(j < length ? state[wid].cvgbuf[x] : 0, &offx, &offy, &nextpixel_cvg, &curpixel_cvbit);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, nextpixel_cvg);
+
+            state[wid].lod_frac = prelodfrac;
+            state[wid].texel0_color = state[wid].nexttexel_color;
+            state[wid].texel1_color = nexttexel1_color;
+
+
+            combiner_2cycle_cycle0(wid, adith, nextpixel_cvg, &acalpha);
+
+            if (wen)
+            {
+                wen &= alpha_compare(wid, acalpha);
+
+
+
+
+                if (wen)
+                {
+                    blender_2cycle_cycle1(wid, &fir, &fig, &fib, cdith, blend_en, prewrap);
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            curpixel_cvg = nextpixel_cvg;
+
+
+
+
+
+
+            z += dzinc;
+
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+
+
+static void render_spans_2cycle_notexelnext(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+    uint32_t nextpixel_cvg;
+    uint32_t acalpha;
+
+    int tile2 = (tilenum + 1) & 7;
+    int tile1 = tilenum;
+    int prim_tile = tilenum;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc, dsinc, dtinc, dwinc;
+    int xinc;
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        dsinc = state[wid].spans_ds;
+        dtinc = state[wid].spans_dt;
+        dwinc = state[wid].spans_dw;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        dsinc = -state[wid].spans_ds;
+        dtinc = -state[wid].spans_dt;
+        dwinc = -state[wid].spans_dw;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+
+    int r, g, b, a, z, s, t, w;
+    int sr, sg, sb, sa, sz, ss, st, sw;
+    int xstart, xend, xendsc;
+    int sss = 0, sst = 0;
+    int curpixel = 0;
+    int wen;
+
+    int x, length, scdiff;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+        s = state[wid].span[i].s;
+        t = state[wid].span[i].t;
+        w = state[wid].span[i].w;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+        if (scdiff)
+        {
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+            s += (dsinc * scdiff);
+            t += (dtinc * scdiff);
+            w += (dwinc * scdiff);
+        }
+
+        for (j = 0; j <= length; j++)
+        {
+            sz = (z >> 10) & 0x3fffff;
+
+            if (!j)
+            {
+                sr = r >> 14;
+                sg = g >> 14;
+                sb = b >> 14;
+                sa = a >> 14;
+                ss = s >> 16;
+                st = t >> 16;
+                sw = w >> 16;
+
+                state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+                tclod_2cycle(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1, &tile2, &state[wid].lod_frac);
+
+                texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+                texture_pipeline_cycle(wid, &state[wid].texel1_color, &state[wid].texel0_color, sss, sst, tile2, 1);
+
+                lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+                rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+
+                if (state[wid].other_modes.f.getditherlevel < 2)
+                    get_dither_noise(wid, x, i, &cdith, &adith);
+
+                combiner_2cycle_cycle0(wid, adith, curpixel_cvg, &acalpha);
+            }
+
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            combiner_2cycle_cycle1(wid, adith, &curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread2_ptr(wid, curpixel, &curpixel_memcvg);
+
+            wen = PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg);
+
+            if (wen)
+                wen &= blender_2cycle_cycle0(wid, curpixel_cvg, curpixel_cvbit);
+            else
+                state[wid].memory_color = state[wid].pre_memory_color;
+
+            x += xinc;
+
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+            s += dsinc;
+            t += dtinc;
+            w += dwinc;
+
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+            ss = s >> 16;
+            st = t >> 16;
+            sw = w >> 16;
+
+            lookup_cvmask_derivatives(j < length ? state[wid].cvgbuf[x] : 0, &offx, &offy, &nextpixel_cvg, &curpixel_cvbit);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, nextpixel_cvg);
+
+            state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+            tclod_2cycle(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1, &tile2, &state[wid].lod_frac);
+
+            texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+            texture_pipeline_cycle(wid, &state[wid].texel1_color, &state[wid].texel0_color, sss, sst, tile2, 1);
+
+            combiner_2cycle_cycle0(wid, adith, nextpixel_cvg, &acalpha);
+
+            if (wen)
+            {
+                wen &= alpha_compare(wid, acalpha);
+
+                if (wen)
+                {
+                    blender_2cycle_cycle1(wid, &fir, &fig, &fib, cdith, blend_en, prewrap);
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            curpixel_cvg = nextpixel_cvg;
+
+            z += dzinc;
+
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+
+static void render_spans_2cycle_notexel1(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+    uint32_t nextpixel_cvg;
+    uint32_t acalpha;
+
+    int tile1 = tilenum;
+    int prim_tile = tilenum;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc, dsinc, dtinc, dwinc;
+    int xinc;
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        dsinc = state[wid].spans_ds;
+        dtinc = state[wid].spans_dt;
+        dwinc = state[wid].spans_dw;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        dsinc = -state[wid].spans_ds;
+        dtinc = -state[wid].spans_dt;
+        dwinc = -state[wid].spans_dw;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+
+    int r, g, b, a, z, s, t, w;
+    int sr, sg, sb, sa, sz, ss, st, sw;
+    int xstart, xend, xendsc;
+    int sss = 0, sst = 0;
+    int curpixel = 0;
+    int wen;
+
+    int x, length, scdiff;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+        s = state[wid].span[i].s;
+        t = state[wid].span[i].t;
+        w = state[wid].span[i].w;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+        if (scdiff)
+        {
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+            s += (dsinc * scdiff);
+            t += (dtinc * scdiff);
+            w += (dwinc * scdiff);
+        }
+
+        for (j = 0; j <= length; j++)
+        {
+            sz = (z >> 10) & 0x3fffff;
+
+            if (!j)
+            {
+                sr = r >> 14;
+                sg = g >> 14;
+                sb = b >> 14;
+                sa = a >> 14;
+                ss = s >> 16;
+                st = t >> 16;
+                sw = w >> 16;
+
+                state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+                tclod_2cycle_notexel1(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1);
+
+                texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+
+                lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+                rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+
+                if (state[wid].other_modes.f.getditherlevel < 2)
+                    get_dither_noise(wid, x, i, &cdith, &adith);
+
+                combiner_2cycle_cycle0(wid, adith, curpixel_cvg, &acalpha);
+            }
+
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            combiner_2cycle_cycle1(wid, adith, &curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread2_ptr(wid, curpixel, &curpixel_memcvg);
+
+            wen = PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg);
+
+            if (wen)
+                wen &= blender_2cycle_cycle0(wid, curpixel_cvg, curpixel_cvbit);
+            else
+                state[wid].memory_color = state[wid].pre_memory_color;
+
+            x += xinc;
+
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+            s += dsinc;
+            t += dtinc;
+            w += dwinc;
+
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+            ss = s >> 16;
+            st = t >> 16;
+            sw = w >> 16;
+
+            lookup_cvmask_derivatives(j < length ? state[wid].cvgbuf[x] : 0, &offx, &offy, &nextpixel_cvg, &curpixel_cvbit);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, nextpixel_cvg);
+
+            state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+            tclod_2cycle_notexel1(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1);
+
+            texture_pipeline_cycle(wid, &state[wid].texel0_color, &state[wid].texel0_color, sss, sst, tile1, 0);
+
+            combiner_2cycle_cycle0(wid, adith, nextpixel_cvg, &acalpha);
+
+            if (wen)
+            {
+                wen &= alpha_compare(wid, acalpha);
+
+                if (wen)
+                {
+                    blender_2cycle_cycle1(wid, &fir, &fig, &fib, cdith, blend_en, prewrap);
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            curpixel_cvg = nextpixel_cvg;
+
+            z += dzinc;
+
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+
+static void render_spans_2cycle_notex(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int zb = state[wid].zb_address >> 1;
+    int zbcur;
+    uint8_t offx, offy;
+    uint32_t blend_en;
+    uint32_t prewrap;
+    uint32_t curpixel_cvg, curpixel_cvbit, curpixel_memcvg;
+    uint32_t nextpixel_cvg;
+    uint32_t acalpha;
+
+    int i, j;
+
+    int drinc, dginc, dbinc, dainc, dzinc;
+    int xinc;
+    if (flip)
+    {
+        drinc = state[wid].spans_dr;
+        dginc = state[wid].spans_dg;
+        dbinc = state[wid].spans_db;
+        dainc = state[wid].spans_da;
+        dzinc = state[wid].spans_dz;
+        xinc = 1;
+    }
+    else
+    {
+        drinc = -state[wid].spans_dr;
+        dginc = -state[wid].spans_dg;
+        dbinc = -state[wid].spans_db;
+        dainc = -state[wid].spans_da;
+        dzinc = -state[wid].spans_dz;
+        xinc = -1;
+    }
+
+    int dzpix;
+    if (!state[wid].other_modes.z_source_sel)
+        dzpix = state[wid].spans_dzpix;
+    else
+    {
+        dzpix = state[wid].primitive_delta_z;
+        dzinc = state[wid].spans_cdz = state[wid].spans_dzdy = 0;
+    }
+    int dzpixenc = dz_compress(dzpix);
+
+    int cdith = 7, adith = 0;
+
+    int r, g, b, a, z;
+    int sr, sg, sb, sa, sz;
+    int xstart, xend, xendsc;
+    int curpixel = 0;
+    int wen;
+
+    int x, length, scdiff;
+    uint32_t fir, fig, fib;
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        extern uint32_t rdp_noise_field;
+        state[wid].rseed = (rdp_noise_field * 0x9e3779b9u)
+                         ^ (state[wid].noise_seq * 0x6c078965u)
+                         ^ ((uint32_t)i * 0x85ebca6bu) ^ 3u;
+
+        xstart = state[wid].span[i].lx;
+        xend = state[wid].span[i].unscrx;
+        xendsc = state[wid].span[i].rx;
+        r = state[wid].span[i].r;
+        g = state[wid].span[i].g;
+        b = state[wid].span[i].b;
+        a = state[wid].span[i].a;
+        z = state[wid].other_modes.z_source_sel ? state[wid].primitive_z : state[wid].span[i].z;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        zbcur = zb + curpixel;
+
+        if (!flip)
+        {
+            length = xendsc - xstart;
+            scdiff = xend - xendsc;
+            compute_cvg_noflip(wid, i);
+        }
+        else
+        {
+            length = xstart - xendsc;
+            scdiff = xendsc - xend;
+            compute_cvg_flip(wid, i);
+        }
+
+        if (scdiff)
+        {
+            scdiff &= 0xfff;
+            r += (drinc * scdiff);
+            g += (dginc * scdiff);
+            b += (dbinc * scdiff);
+            a += (dainc * scdiff);
+            z += (dzinc * scdiff);
+        }
+
+        for (j = 0; j <= length; j++)
+        {
+            sz = (z >> 10) & 0x3fffff;
+
+            if (!j)
+            {
+                sr = r >> 14;
+                sg = g >> 14;
+                sb = b >> 14;
+                sa = a >> 14;
+
+                lookup_cvmask_derivatives(state[wid].cvgbuf[x], &offx, &offy, &curpixel_cvg, &curpixel_cvbit);
+
+                rgba_correct(wid, offx, offy, sr, sg, sb, sa, curpixel_cvg);
+
+                if (state[wid].other_modes.f.getditherlevel < 2)
+                    get_dither_noise(wid, x, i, &cdith, &adith);
+
+                combiner_2cycle_cycle0(wid, adith, curpixel_cvg, &acalpha);
+            }
+
+            z_correct(wid, offx, offy, &sz, curpixel_cvg);
+
+            combiner_2cycle_cycle1(wid, adith, &curpixel_cvg);
+
+            if (PIXEL_IN_ROW(wid, i))
+                state[wid].fbread2_ptr(wid, curpixel, &curpixel_memcvg);
+
+            wen = PIXEL_IN_ROW(wid, i) && z_compare(wid, zbcur, sz, dzpix, dzpixenc, &blend_en, &prewrap, &curpixel_cvg, curpixel_memcvg);
+
+            if (wen)
+                wen &= blender_2cycle_cycle0(wid, curpixel_cvg, curpixel_cvbit);
+            else
+                state[wid].memory_color = state[wid].pre_memory_color;
+
+            x += xinc;
+
+            r += drinc;
+            g += dginc;
+            b += dbinc;
+            a += dainc;
+
+            sr = r >> 14;
+            sg = g >> 14;
+            sb = b >> 14;
+            sa = a >> 14;
+
+            lookup_cvmask_derivatives(j < length ? state[wid].cvgbuf[x] : 0, &offx, &offy, &nextpixel_cvg, &curpixel_cvbit);
+
+            rgba_correct(wid, offx, offy, sr, sg, sb, sa, nextpixel_cvg);
+
+            combiner_2cycle_cycle0(wid, adith, nextpixel_cvg, &acalpha);
+
+            if (wen)
+            {
+                wen &= alpha_compare(wid, acalpha);
+
+                if (wen)
+                {
+                    blender_2cycle_cycle1(wid, &fir, &fig, &fib, cdith, blend_en, prewrap);
+                    state[wid].fbwrite_ptr(wid, curpixel, fir, fig, fib, blend_en, curpixel_cvg, curpixel_memcvg);
+                    if (state[wid].other_modes.z_update_en)
+                        z_store(zbcur, sz, dzpixenc);
+                }
+            }
+
+            if (state[wid].other_modes.f.getditherlevel < 2)
+                get_dither_noise(wid, x, i, &cdith, &adith);
+
+            curpixel_cvg = nextpixel_cvg;
+
+            z += dzinc;
+
+            curpixel += xinc;
+            zbcur += xinc;
+        }
+        }
+    }
+}
+
+
+
+#if defined(AL_SIMD_SSE2) || defined(AL_SIMD_NEON)
+/* Vectorized 16-bit fill: a fill writes fill_color as a 32-bit word to
+ * each physical framebuffer word (the (fb&1) half-select + WORD_ADDR_XOR
+ * swizzle compose to exactly this), with hidden bytes following an
+ * even->hi, odd->lo alternating pattern. Bit-exact to fbfill_16 over a
+ * contiguous ascending run; the renderer's per-pixel order is immaterial
+ * since fill has no read dependency. */
+static void render_fill_row_16(uint32_t wid, uint32_t fb_lo, int count)
+{
+    /* the pixel domain's mask and limit: RDRAM's own at 1x, the wider
+     * ones of the upscaled buffer otherwise - the same domain the
+     * per-pixel fill writes through */
+    uint32_t mask = px_mask16;
+    uint32_t fc32 = state[wid].fill_color;
+    uint32_t vhi = (fc32 >> 16) & 0xffff;
+    uint32_t vlo = fc32 & 0xffff;
+    uint8_t hhi = (uint8_t)(((vhi & 1) << 1) | (vhi & 1));
+    uint8_t hlo = (uint8_t)(((vlo & 1) << 1) | (vlo & 1));
+    uint32_t in_lo = fb_lo & mask;
+    uint32_t in_hi;
+    int n = count;
+
+    /* Bail to scalar on wrap or out-of-range; common spans are interior. */
+    if (count <= 0)
+        return;
+    in_hi = (fb_lo + (uint32_t)(count - 1)) & mask;
+    if (in_hi < in_lo || in_hi > pxlim16)
+    {
+        int k;
+        for (k = 0; k < count; k++)
+            fbfill_16(wid, (fb_lo - (state[wid].fb_address >> 1)) + k);
+        return;
+    }
+
+    {
+        uint32_t in = in_lo;
+#if defined(AL_SIMD_SSE2)
+        __m128i vfc = _mm_set1_epi32((int)fc32);
+#else
+        uint32x4_t vfc = vreinterpretq_u32_u16(vdupq_n_u16(0));
+        vfc = vdupq_n_u32(fc32);
+#endif
+        /* The vector body always begins on an even index, so the hidden
+         * byte pattern is fixed: [hhi, hlo, hhi, hlo, ...]. */
+        uint64_t hpat = (((uint64_t)hlo << 8) | hhi) * 0x0001000100010001ULL;
+        /* scalar pixels until 'in' is even (start of a physical 32-bit word) */
+        while (n > 0 && (in & 1))
+        {
+            px16[in ^ WORD_ADDR_XOR] = (uint16_t)vlo;
+            px_hidden[in] = hlo;
+            in++; n--;
+        }
+        /* 8-pixel (16-byte rdram16 + 8-byte hidden) vector body */
+        while (n >= 8)
+        {
+#if defined(AL_SIMD_SSE2)
+            _mm_storeu_si128((__m128i*)(px16 + in), vfc);
+#else
+            vst1q_u16(px16 + in, vreinterpretq_u16_u32(vfc));
+#endif
+            *(uint64_t*)(px_hidden + in) = hpat;
+            in += 8; n -= 8;
+        }
+        /* scalar tail */
+        while (n > 0)
+        {
+            if (in & 1) { px16[in ^ WORD_ADDR_XOR] = (uint16_t)vlo; px_hidden[in] = hlo; }
+            else        { px16[in ^ WORD_ADDR_XOR] = (uint16_t)vhi; px_hidden[in] = hhi; }
+            in++; n--;
+        }
+    }
+}
+#endif
+
+static void render_spans_fill(uint32_t wid, int start, int end, int flip)
+{
+    if (state[wid].fb_size == PIXEL_SIZE_4BIT)
+    {
+        rdp_pipeline_crashed = 1;
+        return;
+    }
+
+    int i, j;
+
+    int fastkillbits = state[wid].other_modes.image_read_en || state[wid].other_modes.z_compare_en;
+    int slowkillbits = state[wid].other_modes.z_update_en && !state[wid].other_modes.z_source_sel && !fastkillbits;
+
+    int xinc = flip ? 1 : -1;
+
+    int xstart = 0, xendsc;
+    int prevxstart;
+    int curpixel = 0;
+    int x, length;
+
+    for (i = start; i <= end; i++)
+    {
+        prevxstart = xstart;
+        xstart = state[wid].span[i].lx;
+        xendsc = state[wid].span[i].rx;
+
+        x = xendsc;
+        curpixel = state[wid].fb_width * i + x;
+        length = flip ? (xstart - xendsc) : (xendsc - xstart);
+
+        if (state[wid].span[i].validline)
+        {
+            if (fastkillbits && length >= 0)
+            {
+                if (!onetimewarnings.fillmbitcrashes)
+                    msg_warning("render_spans_fill: image_read_en %x z_update_en %x z_compare_en %x. RDP crashed",
+                    state[wid].other_modes.image_read_en, state[wid].other_modes.z_update_en, state[wid].other_modes.z_compare_en);
+                onetimewarnings.fillmbitcrashes = true;
+                rdp_pipeline_crashed = 1;
+                return;
+            }
+
+
+
+
+
+
+
+            /* A FILL triangle is not written as a plain run of pixels: see
+             * rdp/fill_tri.c. Rows the sequential model planned are written
+             * from their plan; other spans walking right to left take the
+             * complemented-trim write law. */
+            if (state[wid].fill_tri == 2 && state[wid].span[i].fplan.m_fill_plan)
+            {
+                fill_tri_run_plan(wid, i, &state[wid].span[i].fplan);
+                continue;
+            }
+            if (state[wid].fill_tri && !flip && length >= 0
+                && (state[wid].fb_size == PIXEL_SIZE_16BIT || state[wid].fb_size == PIXEL_SIZE_32BIT))
+            {
+                fill_tri_write_span(wid, i, xstart, xendsc,
+                                    state[wid].fb_size == PIXEL_SIZE_32BIT ? 4u : 2u);
+                continue;
+            }
+
+#if defined(AL_SIMD_SSE2) || defined(AL_SIMD_NEON)
+            if (state[wid].fb_size == PIXEL_SIZE_16BIT && length >= 0)
+            {
+                uint32_t fb_base = (state[wid].fb_address >> 1) + (uint32_t)(state[wid].fb_width * i);
+                uint32_t fb_lo = flip ? (fb_base + (uint32_t)xendsc)
+                                      : (fb_base + (uint32_t)(xendsc - length));
+                render_fill_row_16(wid, fb_lo, length + 1);
+            }
+            else
+#endif
+            for (j = 0; j <= length; j++)
+            {
+
+                switch(state[wid].fb_size)
+                {
+                case 0:
+                    fbfill_4(wid, curpixel);
+                    break;
+                case 1:
+                    fbfill_8(wid, curpixel);
+                    break;
+                case 2:
+                    fbfill_16(wid, curpixel);
+                    break;
+                case 3:
+                default:
+                    fbfill_32(wid, curpixel);
+                    break;
+                }
+
+                x += xinc;
+                curpixel += xinc;
+            }
+
+            if (slowkillbits && length >= 0)
+            {
+                if (!onetimewarnings.fillmbitcrashes)
+                    msg_warning("render_spans_fill: image_read_en %x z_update_en %x z_compare_en %x z_source_sel %x. RDP crashed",
+                    state[wid].other_modes.image_read_en, state[wid].other_modes.z_update_en, state[wid].other_modes.z_compare_en, state[wid].other_modes.z_source_sel);
+                onetimewarnings.fillmbitcrashes = 1;
+                rdp_pipeline_crashed = 1;
+                return;
+            }
+        }
+    }
+}
+
+static void render_spans_copy(uint32_t wid, int start, int end, int tilenum, int flip)
+{
+    int i, j, k;
+
+    if (state[wid].fb_size == PIXEL_SIZE_32BIT)
+    {
+        rdp_pipeline_crashed = 1;
+        return;
+    }
+
+    int tile1 = tilenum;
+    int prim_tile = tilenum;
+
+    int dsinc, dtinc, dwinc;
+    int xinc;
+    if (flip)
+    {
+        dsinc = state[wid].spans_ds;
+        dtinc = state[wid].spans_dt;
+        dwinc = state[wid].spans_dw;
+        xinc = 1;
+    }
+    else
+    {
+        dsinc = -state[wid].spans_ds;
+        dtinc = -state[wid].spans_dt;
+        dwinc = -state[wid].spans_dw;
+        xinc = -1;
+    }
+
+    int xstart = 0, xendsc;
+    int s = 0, t = 0, w = 0, ss = 0, st = 0, sw = 0, sss = 0, sst = 0, ssw = 0;
+    int fb_index, length;
+    int diff = 0;
+
+    uint32_t hidword = 0, lowdword = 0;
+    uint32_t hidword1 = 0, lowdword1 = 0;
+    int fbadvance = (state[wid].fb_size == PIXEL_SIZE_4BIT) ? 8 : 16 >> state[wid].fb_size;
+    uint32_t fbptr = 0;
+    int fbptr_advance = flip ? 8 : -8;
+    uint64_t copyqword = 0;
+    uint32_t tempdword = 0, tempbyte = 0;
+    int copywmask = 0, alphamask = 0;
+    int bytesperpixel = (state[wid].fb_size == PIXEL_SIZE_4BIT) ? 1 : (1 << (state[wid].fb_size - 1));
+    uint32_t fbendptr = 0;
+    int32_t threshold, currthreshold;
+
+#define PIXELS_TO_BYTES_SPECIAL4(pix, siz) ((siz) ? PIXELS_TO_BYTES(pix, siz) : (pix))
+
+    for (i = start; i <= end; i++)
+    {
+        if (state[wid].span[i].validline)
+        {
+
+        s = state[wid].span[i].s;
+        t = state[wid].span[i].t;
+        w = state[wid].span[i].w;
+
+        xstart = state[wid].span[i].lx;
+        xendsc = state[wid].span[i].rx;
+
+        fb_index = state[wid].fb_width * i + xendsc;
+        fbptr = state[wid].fb_address + PIXELS_TO_BYTES_SPECIAL4(fb_index, state[wid].fb_size);
+        fbendptr = state[wid].fb_address + PIXELS_TO_BYTES_SPECIAL4((state[wid].fb_width * i + xstart), state[wid].fb_size);
+        length = flip ? (xstart - xendsc) : (xendsc - xstart);
+
+
+
+
+        for (j = 0; j <= length; j += fbadvance)
+        {
+            ss = s >> 16;
+            st = t >> 16;
+            sw = w >> 16;
+
+            state[wid].tcdiv_ptr(ss, st, sw, &sss, &sst);
+
+            tclod_copy(wid, &sss, &sst, s, t, w, dsinc, dtinc, dwinc, prim_tile, &tile1);
+
+
+
+            fetch_qword_copy(wid, &hidword, &lowdword, sss, sst, tile1);
+
+
+
+            if (state[wid].fb_size == PIXEL_SIZE_16BIT || state[wid].fb_size == PIXEL_SIZE_8BIT)
+                copyqword = ((uint64_t)hidword << 32) | ((uint64_t)lowdword);
+            else
+                copyqword = 0;
+
+            /* Copy mode moves a qword of consecutive texels to as many
+             * consecutive pixels. On the finer grid a texel spans
+             * al_scale pixels, so the qword is repacked with each texel
+             * repeated that many times; the step already advances s by
+             * the texels the qword covers at this scale. */
+            if (al_scale > 1 && copyqword)
+            {
+                uint64_t q = 0;
+                int k;
+                if (state[wid].fb_size == PIXEL_SIZE_16BIT)
+                    for (k = 0; k < 4; k++)
+                        q |= ((copyqword >> (48 - 16 * (k >> al_scale_log2))) & 0xffff) << (48 - 16 * k);
+                else
+                    for (k = 0; k < 8; k++)
+                        q |= ((copyqword >> (56 - 8 * (k >> al_scale_log2))) & 0xff) << (56 - 8 * k);
+                copyqword = q;
+            }
+
+
+            if (!state[wid].other_modes.alpha_compare_en)
+                alphamask = 0xff;
+            else if (state[wid].fb_size == PIXEL_SIZE_16BIT)
+            {
+                alphamask = 0;
+                alphamask |= (((copyqword >> 48) & 1) ? 0xC0 : 0);
+                alphamask |= (((copyqword >> 32) & 1) ? 0x30 : 0);
+                alphamask |= (((copyqword >> 16) & 1) ? 0xC : 0);
+                alphamask |= ((copyqword & 1) ? 0x3 : 0);
+            }
+            else if (state[wid].fb_size == PIXEL_SIZE_8BIT)
+            {
+                alphamask = 0;
+                threshold = (state[wid].other_modes.dither_alpha_en) ? (irand(&state[wid].rseed) & 0xff) : state[wid].blend_color.a;
+                if (state[wid].other_modes.dither_alpha_en)
+                {
+                    currthreshold = threshold;
+                    alphamask |= (((copyqword >> 24) & 0xff) >= currthreshold ? 0xC0 : 0);
+                    currthreshold = ((threshold & 3) << 6) | (threshold >> 2);
+                    alphamask |= (((copyqword >> 16) & 0xff) >= currthreshold ? 0x30 : 0);
+                    currthreshold = ((threshold & 0xf) << 4) | (threshold >> 4);
+                    alphamask |= (((copyqword >> 8) & 0xff) >= currthreshold ? 0xC : 0);
+                    currthreshold = ((threshold & 0x3f) << 2) | (threshold >> 6);
+                    alphamask |= ((copyqword & 0xff) >= currthreshold ? 0x3 : 0);
+                }
+                else
+                {
+                    alphamask |= (((copyqword >> 24) & 0xff) >= threshold ? 0xC0 : 0);
+                    alphamask |= (((copyqword >> 16) & 0xff) >= threshold ? 0x30 : 0);
+                    alphamask |= (((copyqword >> 8) & 0xff) >= threshold ? 0xC : 0);
+                    alphamask |= ((copyqword & 0xff) >= threshold ? 0x3 : 0);
+                }
+            }
+            else
+                alphamask = 0;
+
+            copywmask = (flip) ? (fbendptr - fbptr + bytesperpixel) : (fbptr - fbendptr + bytesperpixel);
+
+            if (copywmask > 8)
+                copywmask = 8;
+            tempdword = fbptr;
+            k = 7;
+            while(copywmask > 0)
+            {
+                tempbyte = (uint32_t)((copyqword >> (k << 3)) & 0xff);
+                if (alphamask & (1 << k))
+                {
+                    PAIRWRITE8(tempdword, tempbyte, (tempbyte & 1) ? 3 : 0);
+                }
+                k--;
+                tempdword += xinc;
+                copywmask--;
+            }
+
+            s += dsinc;
+            t += dtinc;
+            w += dwinc;
+            fbptr += fbptr_advance;
+        }
+        }
+    }
+}
+
+#if defined(AL_SIMD_SSE2)
+/* 4-lane 32x32 -> low 32 multiply (SSE2 lacks _mm_mullo_epi32). Low 32 bits
+ * are signedness-independent, so the unsigned _mm_mul_epu32 pair is exact. */
+static INLINE __m128i ew_mul32(__m128i a, __m128i b)
+{
+    __m128i e = _mm_mul_epu32(a, b);
+    __m128i o = _mm_mul_epu32(_mm_srli_si128(a, 4), _mm_srli_si128(b, 4));
+    return _mm_unpacklo_epi32(_mm_shuffle_epi32(e, 0x08), _mm_shuffle_epi32(o, 0x08));
+}
+#endif
+
+static void edgewalker_for_prims(uint32_t wid, int32_t* ewdata)
+{
+    state[wid].noise_seq++;
+    int j = 0;
+    int xleft = 0, xright = 0, xleft_inc = 0, xright_inc = 0;
+    int r = 0, g = 0, b = 0, a = 0, z = 0, s = 0, t = 0, w = 0;
+    int dr = 0, dg = 0, db = 0, da = 0;
+    int drdx = 0, dgdx = 0, dbdx = 0, dadx = 0, dzdx = 0, dsdx = 0, dtdx = 0, dwdx = 0;
+    int drdy = 0, dgdy = 0, dbdy = 0, dady = 0, dzdy = 0, dsdy = 0, dtdy = 0, dwdy = 0;
+    int drde = 0, dgde = 0, dbde = 0, dade = 0, dzde = 0, dsde = 0, dtde = 0, dwde = 0;
+    int tilenum = 0, flip = 0;
+    int32_t yl = 0, ym = 0, yh = 0;
+    int32_t xl = 0, xm = 0, xh = 0;
+    int32_t dxldy = 0, dxhdy = 0, dxmdy = 0;
+
+    if (state[wid].other_modes.f.stalederivs)
+    {
+        deduce_derivatives(wid);
+        state[wid].other_modes.f.stalederivs = 0;
+    }
+
+
+    flip = (ewdata[0] & 0x800000) != 0;
+    state[wid].max_level = (ewdata[0] >> 19) & 7;
+    tilenum = (ewdata[0] >> 16) & 7;
+
+
+    yl = SIGN(ewdata[0], 14);
+    ym = ewdata[1] >> 16;
+    ym = SIGN(ym, 14);
+    yh = SIGN(ewdata[1], 14);
+
+    xl = SIGN(ewdata[2], 28);
+    xh = SIGN(ewdata[4], 28);
+    xm = SIGN(ewdata[6], 28);
+
+    /* Upscaling renders on a grid al_scale times finer in each axis. The
+     * edges and the scanline space scale with it; the slopes do not,
+     * because both of their axes scale and dxdy is their ratio. The
+     * attribute derivatives are per scanline and per pixel, so they are
+     * quantised to the finer grid - the seek below then steps whole
+     * pixels with the full derivative and the subpixels between them
+     * with the quantised one, which is what keeps an upscaled render
+     * equal to the unscaled one wherever the two share a sample. */
+    if (al_scale > 1)
+    {
+        yl <<= al_scale_log2;
+        ym <<= al_scale_log2;
+        yh <<= al_scale_log2;
+        xl <<= al_scale_log2;
+        xm <<= al_scale_log2;
+        xh <<= al_scale_log2;
+        /* A fill or copy rectangle names its bottom row by its last
+         * console subline (yl |= 3) and its right column inclusively.
+         * Scaling that subline by the factor lands on the FIRST scaled
+         * subline of the row's last console subline, not the last of the
+         * row: the shift turns |3 into |12, leaving the final three
+         * scaled sublines of every rectangle's bottom row - and the last
+         * subpixels of its right column - unwritten. The game's depth
+         * clear is such a rectangle, so those sublines keep the previous
+         * frame's depth, and surfaces drawn there afterwards lose the
+         * depth test to it along a band one console row apart. Extend to
+         * the last scaled subline and subpixel here, after the shift. */
+        if (state[wid].other_modes.cycle_type == CYCLE_TYPE_FILL || state[wid].other_modes.cycle_type == CYCLE_TYPE_COPY)
+        {
+            yl |= (4 << al_scale_log2) - 1;
+            xl |= (1 << (16 + al_scale_log2)) - 1;
+        }
+    }
+
+    dxldy = SIGN(ewdata[3], 30);
+
+
+
+    dxhdy = SIGN(ewdata[5], 30);
+    dxmdy = SIGN(ewdata[7], 30);
+
+
+    r    = (ewdata[8] & 0xffff0000) | ((ewdata[12] >> 16) & 0x0000ffff);
+    g    = ((ewdata[8] << 16) & 0xffff0000) | (ewdata[12] & 0x0000ffff);
+    b    = (ewdata[9] & 0xffff0000) | ((ewdata[13] >> 16) & 0x0000ffff);
+    a    = ((ewdata[9] << 16) & 0xffff0000) | (ewdata[13] & 0x0000ffff);
+    drdx = (ewdata[10] & 0xffff0000) | ((ewdata[14] >> 16) & 0x0000ffff);
+    dgdx = ((ewdata[10] << 16) & 0xffff0000) | (ewdata[14] & 0x0000ffff);
+    dbdx = (ewdata[11] & 0xffff0000) | ((ewdata[15] >> 16) & 0x0000ffff);
+    dadx = ((ewdata[11] << 16) & 0xffff0000) | (ewdata[15] & 0x0000ffff);
+    drde = (ewdata[16] & 0xffff0000) | ((ewdata[20] >> 16) & 0x0000ffff);
+    dgde = ((ewdata[16] << 16) & 0xffff0000) | (ewdata[20] & 0x0000ffff);
+    dbde = (ewdata[17] & 0xffff0000) | ((ewdata[21] >> 16) & 0x0000ffff);
+    dade = ((ewdata[17] << 16) & 0xffff0000) | (ewdata[21] & 0x0000ffff);
+    drdy = (ewdata[18] & 0xffff0000) | ((ewdata[22] >> 16) & 0x0000ffff);
+    dgdy = ((ewdata[18] << 16) & 0xffff0000) | (ewdata[22] & 0x0000ffff);
+    dbdy = (ewdata[19] & 0xffff0000) | ((ewdata[23] >> 16) & 0x0000ffff);
+    dady = ((ewdata[19] << 16) & 0xffff0000) | (ewdata[23] & 0x0000ffff);
+
+
+    s    = (ewdata[24] & 0xffff0000) | ((ewdata[28] >> 16) & 0x0000ffff);
+    t    = ((ewdata[24] << 16) & 0xffff0000)    | (ewdata[28] & 0x0000ffff);
+    w    = (ewdata[25] & 0xffff0000) | ((ewdata[29] >> 16) & 0x0000ffff);
+    dsdx = (ewdata[26] & 0xffff0000) | ((ewdata[30] >> 16) & 0x0000ffff);
+    dtdx = ((ewdata[26] << 16) & 0xffff0000)    | (ewdata[30] & 0x0000ffff);
+    dwdx = (ewdata[27] & 0xffff0000) | ((ewdata[31] >> 16) & 0x0000ffff);
+    dsde = (ewdata[32] & 0xffff0000) | ((ewdata[36] >> 16) & 0x0000ffff);
+    dtde = ((ewdata[32] << 16) & 0xffff0000)    | (ewdata[36] & 0x0000ffff);
+    dwde = (ewdata[33] & 0xffff0000) | ((ewdata[37] >> 16) & 0x0000ffff);
+    dsdy = (ewdata[34] & 0xffff0000) | ((ewdata[38] >> 16) & 0x0000ffff);
+    dtdy = ((ewdata[34] << 16) & 0xffff0000)    | (ewdata[38] & 0x0000ffff);
+    dwdy = (ewdata[35] & 0xffff0000) | ((ewdata[39] >> 16) & 0x0000ffff);
+
+
+    z    = ewdata[40];
+    dzdx = ewdata[41];
+    dzde = ewdata[42];
+    dzdy = ewdata[43];
+
+
+
+
+
+
+
+    /* Quantise the derivatives to the finer grid before anything reads
+     * them: the span setup below latches the per-pixel steps, so scaling
+     * them afterwards would leave the shading stepping a whole console
+     * pixel's worth of gradient per subpixel. */
+    if (al_scale > 1)
+    {
+        /* the per-scanline derivatives are not divided here: the seek
+         * below snaps them, stepping whole console scanlines with the
+         * full derivative and the subpixel lines between them with the
+         * quantised one, so a line the two grids share carries the same
+         * value rather than an accumulation of rounding
+         */
+        drdy >>= al_scale_log2; dgdy >>= al_scale_log2;
+        dbdy >>= al_scale_log2; dady >>= al_scale_log2;
+        dsdy >>= al_scale_log2; dtdy >>= al_scale_log2;
+        dwdy >>= al_scale_log2; dzdy >>= al_scale_log2;
+        /* per pixel of the finer grid */
+        drdx >>= al_scale_log2; dgdx >>= al_scale_log2;
+        dbdx >>= al_scale_log2; dadx >>= al_scale_log2;
+        dsdx >>= al_scale_log2; dtdx >>= al_scale_log2;
+        dwdx >>= al_scale_log2; dzdx >>= al_scale_log2;
+    }
+
+    state[wid].spans_ds = dsdx & ~0x1f;
+    state[wid].spans_dt = dtdx & ~0x1f;
+    state[wid].spans_dw = dwdx & ~0x1f;
+    state[wid].spans_dr = drdx & ~0x1f;
+    state[wid].spans_dg = dgdx & ~0x1f;
+    state[wid].spans_db = dbdx & ~0x1f;
+    state[wid].spans_da = dadx & ~0x1f;
+    state[wid].spans_dz = dzdx;
+
+
+    state[wid].spans_drdy = drdy >> 14;
+    state[wid].spans_dgdy = dgdy >> 14;
+    state[wid].spans_dbdy = dbdy >> 14;
+    state[wid].spans_dady = dady >> 14;
+    state[wid].spans_dzdy = dzdy >> 10;
+    state[wid].spans_drdy = SIGN(state[wid].spans_drdy, 13);
+    state[wid].spans_dgdy = SIGN(state[wid].spans_dgdy, 13);
+    state[wid].spans_dbdy = SIGN(state[wid].spans_dbdy, 13);
+    state[wid].spans_dady = SIGN(state[wid].spans_dady, 13);
+    state[wid].spans_dzdy = SIGN(state[wid].spans_dzdy, 22);
+    state[wid].spans_cdr = state[wid].spans_dr >> 14;
+    state[wid].spans_cdr = SIGN(state[wid].spans_cdr, 13);
+    state[wid].spans_cdg = state[wid].spans_dg >> 14;
+    state[wid].spans_cdg = SIGN(state[wid].spans_cdg, 13);
+    state[wid].spans_cdb = state[wid].spans_db >> 14;
+    state[wid].spans_cdb = SIGN(state[wid].spans_cdb, 13);
+    state[wid].spans_cda = state[wid].spans_da >> 14;
+    state[wid].spans_cda = SIGN(state[wid].spans_cda, 13);
+    state[wid].spans_cdz = state[wid].spans_dz >> 10;
+    state[wid].spans_cdz = SIGN(state[wid].spans_cdz, 22);
+
+    state[wid].spans_dsdy = dsdy & ~0x7fff;
+    state[wid].spans_dtdy = dtdy & ~0x7fff;
+    state[wid].spans_dwdy = dwdy & ~0x7fff;
+
+
+    /* The depth tolerance dzpix is the console's, per console pixel: the
+     * derivatives here are the size of a pixel of the finer grid, so
+     * they are scaled back up for it. Left unscaled the tolerance
+     * shrinks with the grid, and coplanar surfaces that never fought at
+     * 1x fight along their shared edges. The interpolation keeps the
+     * finer per-pixel steps; only the tolerance is judged per console
+     * pixel. */
+    int dzdy_dz = ((dzdy << al_scale_log2) >> 16) & 0xffff;
+    int dzdx_dz = ((dzdx << al_scale_log2) >> 16) & 0xffff;
+
+    state[wid].spans_dzpix = ((dzdy_dz & 0x8000) ? ((~dzdy_dz) & 0x7fff) : dzdy_dz) + ((dzdx_dz & 0x8000) ? ((~dzdx_dz) & 0x7fff) : dzdx_dz);
+    state[wid].spans_dzpix = normalize_dzpix(state[wid].spans_dzpix & 0xffff) & 0xffff;
+
+
+
+    xleft_inc = (dxmdy >> 2) & ~0x1;
+    xright_inc = (dxhdy >> 2) & ~0x1;
+
+
+
+    xright = xh & ~0x1;
+
+    /* Span-buffer test model: once a DPS register has been written, a
+     * 1-cycle triangle schedules the window the CPU can read back. */
+    state[wid].dps.cap_on = 0;
+    if (al_dps_armed && al_scale == 1
+        && state[wid].other_modes.cycle_type == CYCLE_TYPE_1
+        && (state[wid].fb_size == PIXEL_SIZE_32BIT || state[wid].fb_size == PIXEL_SIZE_16BIT))
+    {
+        uint32_t dps_id = ((uint32_t)ewdata[0] >> 24) & 0x3f;
+        if (dps_id >= 0x08 && dps_id <= 0x0f)
+            dps_prepass(wid, flip, yh, ym, yl, xh, xm, xl, dxhdy, dxmdy, dxldy);
+    }
+
+    /* FILL triangles: run the sequential write model over the whole
+     * primitive before this lane walks its own lines. A rectangle is a
+     * FILL_RECTANGLE or TEXTURE_RECTANGLE command here, which the header
+     * word still carries. */
+    if ((((uint32_t)ewdata[0] >> 24) & 0x3f) != 0x36)
+        state[wid].rect_stale.valid = 0;
+    state[wid].fill_tri = 0;
+    if (state[wid].other_modes.cycle_type == CYCLE_TYPE_FILL && al_scale == 1)
+    {
+        uint32_t ew_id = ((uint32_t)ewdata[0] >> 24) & 0x3f;
+        if (ew_id >= 0x08 && ew_id <= 0x0f)
+        {
+            state[wid].fill_tri = 1;
+            if (state[wid].fb_size == PIXEL_SIZE_32BIT
+                && fill_tri_prepass(wid, flip, yh, ym, yl, xh, xm, xl, dxhdy, dxmdy, dxldy))
+                state[wid].fill_tri = 2;
+        }
+    }
+    xleft = xm & ~0x1;
+
+    int k = 0;
+
+    int dsdiff, dtdiff, dwdiff, drdiff, dgdiff, dbdiff, dadiff, dzdiff;
+    int sign_dxhdy = (ewdata[5] & 0x80000000) != 0;
+
+    int dsdeh, dtdeh, dwdeh, drdeh, dgdeh, dbdeh, dadeh, dzdeh, dsdyh, dtdyh, dwdyh, drdyh, dgdyh, dbdyh, dadyh, dzdyh;
+    int do_offset = !(sign_dxhdy ^ flip);
+
+    if (do_offset)
+    {
+        /* The per-scanline derivatives stay whole for the seek, which
+         * snaps them; here they are the size of one scanline of the finer
+         * grid, like the dy and dx terms they are combined with. */
+        dsdeh = (dsde >> al_scale_log2) & ~0x1ff;
+        dtdeh = (dtde >> al_scale_log2) & ~0x1ff;
+        dwdeh = (dwde >> al_scale_log2) & ~0x1ff;
+        drdeh = (drde >> al_scale_log2) & ~0x1ff;
+        dgdeh = (dgde >> al_scale_log2) & ~0x1ff;
+        dbdeh = (dbde >> al_scale_log2) & ~0x1ff;
+        dadeh = (dade >> al_scale_log2) & ~0x1ff;
+        dzdeh = (dzde >> al_scale_log2) & ~0x1ff;
+
+        dsdyh = dsdy & ~0x1ff;
+        dtdyh = dtdy & ~0x1ff;
+        dwdyh = dwdy & ~0x1ff;
+        drdyh = drdy & ~0x1ff;
+        dgdyh = dgdy & ~0x1ff;
+        dbdyh = dbdy & ~0x1ff;
+        dadyh = dady & ~0x1ff;
+        dzdyh = dzdy & ~0x1ff;
+
+
+
+
+
+
+
+        dsdiff = dsdeh - (dsdeh >> 2) - dsdyh + (dsdyh >> 2);
+        dtdiff = dtdeh - (dtdeh >> 2) - dtdyh + (dtdyh >> 2);
+        dwdiff = dwdeh - (dwdeh >> 2) - dwdyh + (dwdyh >> 2);
+        drdiff = drdeh - (drdeh >> 2) - drdyh + (drdyh >> 2);
+        dgdiff = dgdeh - (dgdeh >> 2) - dgdyh + (dgdyh >> 2);
+        dbdiff = dbdeh - (dbdeh >> 2) - dbdyh + (dbdyh >> 2);
+        dadiff = dadeh - (dadeh >> 2) - dadyh + (dadyh >> 2);
+        dzdiff = dzdeh - (dzdeh >> 2) - dzdyh + (dzdyh >> 2);
+
+    }
+    else
+        dsdiff = dtdiff = dwdiff = drdiff = dgdiff = dbdiff = dadiff = dzdiff = 0;
+
+    int xfrac = 0;
+
+    int dsdxh, dtdxh, dwdxh, drdxh, dgdxh, dbdxh, dadxh, dzdxh;
+    if (state[wid].other_modes.cycle_type != CYCLE_TYPE_COPY)
+    {
+        dsdxh = (dsdx >> 8) & ~1;
+        dtdxh = (dtdx >> 8) & ~1;
+        dwdxh = (dwdx >> 8) & ~1;
+        drdxh = (drdx >> 8) & ~1;
+        dgdxh = (dgdx >> 8) & ~1;
+        dbdxh = (dbdx >> 8) & ~1;
+        dadxh = (dadx >> 8) & ~1;
+        dzdxh = (dzdx >> 8) & ~1;
+    }
+    else
+        dsdxh = dtdxh = dwdxh = drdxh = dgdxh = dbdxh = dadxh = dzdxh = 0;
+
+
+
+
+
+#if !defined(AL_SIMD_SSE2) && !defined(AL_SIMD_NEON)
+    const int r0 = r, g0 = g, b0 = b, a0 = a, s0 = s, t0 = t, w0 = w, z0 = z;
+#endif
+#if defined(AL_SIMD_SSE2)
+    /* The 8 span attributes are sought per owned line (SEEK_ATTR) and
+     * consumed (ADJUST) only here, so they live in two vectors across the
+     * walk: no transpose, no scalar round-trip. Lane order matches struct
+     * span {r,g,b,a,s,t,w,z}. */
+    __m128i ew_av0 = _mm_set_epi32(a, b, g, r);
+    __m128i ew_av1 = _mm_set_epi32(z, w, t, s);
+    const __m128i ew_av0_base = ew_av0;
+    const __m128i ew_av1_base = ew_av1;
+    const __m128i ew_dev0 = _mm_set_epi32(dade, dbde, dgde, drde);
+    const __m128i ew_dev1 = _mm_set_epi32(dzde, dwde, dtde, dsde);
+    const __m128i ew_diff0 = _mm_set_epi32(dadiff, dbdiff, dgdiff, drdiff);
+    const __m128i ew_diff1 = _mm_set_epi32(dzdiff, dwdiff, dtdiff, dsdiff);
+    const __m128i ew_dxh0 = _mm_set_epi32(dadxh, dbdxh, dgdxh, drdxh);
+    const __m128i ew_dxh1 = _mm_set_epi32(dzdxh, dwdxh, dtdxh, dsdxh);
+    const __m128i ew_m1 = _mm_set1_epi32(~0x1ff), ew_m3 = _mm_set1_epi32(~0x3ff);
+#define ADJUST_ATTR_PRIM()                                                      \
+{                                                                               \
+    __m128i ew_xf = _mm_set1_epi32(xfrac);                                      \
+    _mm_storeu_si128((__m128i*)&state[wid].span[j].r,                           \
+        _mm_and_si128(_mm_sub_epi32(_mm_add_epi32(_mm_and_si128(ew_av0, ew_m1), \
+            ew_diff0), ew_mul32(ew_xf, ew_dxh0)), ew_m3));                      \
+    _mm_storeu_si128((__m128i*)&state[wid].span[j].s,                           \
+        _mm_and_si128(_mm_sub_epi32(_mm_add_epi32(_mm_and_si128(ew_av1, ew_m1), \
+            ew_diff1), ew_mul32(ew_xf, ew_dxh1)), ew_m3));                      \
+}
+/* attribute values at line n of the walk: start + n * per-line step, the
+ * exact 32-bit wrap of n additions */
+#define SEEK_ATTR_PRIM(n)                                                       \
+{                                                                               \
+    if (!al_scale_log2)                                                         \
+    {                                                                           \
+        __m128i ew_n = _mm_set1_epi32((int)(n));                                \
+        ew_av0 = _mm_add_epi32(ew_av0_base, ew_mul32(ew_n, ew_dev0));           \
+        ew_av1 = _mm_add_epi32(ew_av1_base, ew_mul32(ew_n, ew_dev1));           \
+    }                                                                           \
+    else                                                                        \
+    {                                                                           \
+        /* whole console scanlines with the full derivative, the finer  \
+         * lines between them with the quantised one */                         \
+        __m128i ew_sh = _mm_cvtsi32_si128((int)al_scale_log2);                  \
+        __m128i ew_nh = _mm_set1_epi32((int)(n) >> al_scale_log2);              \
+        __m128i ew_nl = _mm_set1_epi32((int)(n) & (int)(al_scale - 1));         \
+        ew_av0 = _mm_add_epi32(ew_av0_base, _mm_add_epi32(                      \
+            ew_mul32(ew_nh, ew_dev0), ew_mul32(ew_nl, _mm_sra_epi32(ew_dev0, ew_sh)))); \
+        ew_av1 = _mm_add_epi32(ew_av1_base, _mm_add_epi32(                      \
+            ew_mul32(ew_nh, ew_dev1), ew_mul32(ew_nl, _mm_sra_epi32(ew_dev1, ew_sh)))); \
+    }                                                                           \
+}
+#elif defined(AL_SIMD_NEON)
+    int32x4_t ew_av0 = { r, g, b, a };
+    int32x4_t ew_av1 = { s, t, w, z };
+    const int32x4_t ew_av0_base = ew_av0;
+    const int32x4_t ew_av1_base = ew_av1;
+    const int32x4_t ew_dev0 = { drde, dgde, dbde, dade };
+    const int32x4_t ew_dev1 = { dsde, dtde, dwde, dzde };
+    const int32x4_t ew_diff0 = { drdiff, dgdiff, dbdiff, dadiff };
+    const int32x4_t ew_diff1 = { dsdiff, dtdiff, dwdiff, dzdiff };
+    const int32x4_t ew_dxh0 = { drdxh, dgdxh, dbdxh, dadxh };
+    const int32x4_t ew_dxh1 = { dsdxh, dtdxh, dwdxh, dzdxh };
+    const int32x4_t ew_m1 = vdupq_n_s32(~0x1ff), ew_m3 = vdupq_n_s32(~0x3ff);
+#define ADJUST_ATTR_PRIM()                                                      \
+{                                                                               \
+    int32x4_t ew_xf = vdupq_n_s32(xfrac);                                       \
+    vst1q_s32(&state[wid].span[j].r, vandq_s32(vsubq_s32(vaddq_s32(             \
+        vandq_s32(ew_av0, ew_m1), ew_diff0), vmulq_s32(ew_xf, ew_dxh0)), ew_m3)); \
+    vst1q_s32(&state[wid].span[j].s, vandq_s32(vsubq_s32(vaddq_s32(             \
+        vandq_s32(ew_av1, ew_m1), ew_diff1), vmulq_s32(ew_xf, ew_dxh1)), ew_m3)); \
+}
+#define SEEK_ATTR_PRIM(n)                                                       \
+{                                                                               \
+    if (!al_scale_log2)                                                         \
+    {                                                                           \
+        int32x4_t ew_n = vdupq_n_s32((int)(n));                                 \
+        ew_av0 = vmlaq_s32(ew_av0_base, ew_dev0, ew_n);                         \
+        ew_av1 = vmlaq_s32(ew_av1_base, ew_dev1, ew_n);                         \
+    }                                                                           \
+    else                                                                        \
+    {                                                                           \
+        int32x4_t ew_sh = vdupq_n_s32(-(int)al_scale_log2);                     \
+        int32x4_t ew_nh = vdupq_n_s32((int)(n) >> al_scale_log2);               \
+        int32x4_t ew_nl = vdupq_n_s32((int)(n) & (int)(al_scale - 1));          \
+        ew_av0 = vmlaq_s32(vmlaq_s32(ew_av0_base, ew_dev0, ew_nh),              \
+            vshlq_s32(ew_dev0, ew_sh), ew_nl);                                  \
+        ew_av1 = vmlaq_s32(vmlaq_s32(ew_av1_base, ew_dev1, ew_nh),              \
+            vshlq_s32(ew_dev1, ew_sh), ew_nl);                                  \
+    }                                                                           \
+}
+#else
+#define ADJUST_ATTR_PRIM()      \
+{                           \
+    state[wid].span[j].s = ((s & ~0x1ff) + dsdiff - (xfrac * dsdxh)) & ~0x3ff;             \
+    state[wid].span[j].t = ((t & ~0x1ff) + dtdiff - (xfrac * dtdxh)) & ~0x3ff;             \
+    state[wid].span[j].w = ((w & ~0x1ff) + dwdiff - (xfrac * dwdxh)) & ~0x3ff;             \
+    state[wid].span[j].r = ((r & ~0x1ff) + drdiff - (xfrac * drdxh)) & ~0x3ff;             \
+    state[wid].span[j].g = ((g & ~0x1ff) + dgdiff - (xfrac * dgdxh)) & ~0x3ff;             \
+    state[wid].span[j].b = ((b & ~0x1ff) + dbdiff - (xfrac * dbdxh)) & ~0x3ff;             \
+    state[wid].span[j].a = ((a & ~0x1ff) + dadiff - (xfrac * dadxh)) & ~0x3ff;             \
+    state[wid].span[j].z = ((z & ~0x1ff) + dzdiff - (xfrac * dzdxh)) & ~0x3ff;             \
+}
+
+
+#define AL_SNAP(v0, n, d) \
+    (int)((uint32_t)(v0) + (uint32_t)((n) >> al_scale_log2) * (uint32_t)(d) \
+        + (uint32_t)((n) & (int)(al_scale - 1)) * (uint32_t)((d) >> al_scale_log2))
+
+#define SEEK_ATTR_PRIM(n) {  \
+            s = AL_SNAP(s0, n, dsde);  \
+            t = AL_SNAP(t0, n, dtde);  \
+            w = AL_SNAP(w0, n, dwde);  \
+            r = AL_SNAP(r0, n, drde);  \
+            g = AL_SNAP(g0, n, dgde);  \
+            b = AL_SNAP(b0, n, dbde);  \
+            a = AL_SNAP(a0, n, dade);  \
+            z = AL_SNAP(z0, n, dzde);  \
+}
+#endif
+
+    int32_t maxxmx, minxmx, maxxhx, minxhx;
+
+    int spix = 0;
+    /* The walk starts on the console row that contains yh, and the edges
+     * are stepped from that row's first subline. A console row is four
+     * sublines at 1x and 4 << al_scale_log2 on the finer grid, so the
+     * row mask widens with the grid: aligning to a scaled row instead
+     * starts the edge step short by up to three console sublines' worth,
+     * and an edge two triangles share is then walked from different
+     * origins by each - a gap the width of that missed step opens along
+     * it, with whatever was drawn before showing through. */
+    const int row_mask = (4 << al_scale_log2) - 1;
+    int ycur =  yh & ~row_mask;
+    int ldflag = (sign_dxhdy ^ flip) ? 0 : 3;
+    int invaly = 1;
+    int length = 0;
+    int32_t xrsc = 0, xlsc = 0, stickybit = 0;
+    int32_t yllimit = 0, yhlimit = 0;
+    /* The scanline coordinates are read as a fixed-width field, so the
+     * field grows with the finer grid: what was the fourteenth bit of a
+     * console coordinate is the fourteenth plus log2 of the factor
+     * here. */
+    const int32_t y_top  = 0x2000 << al_scale_log2;
+    const int32_t y_next = 0x1000 << al_scale_log2;
+    const int32_t y_mask = y_next - 1;
+    if (yl & y_top)
+        yllimit = 1;
+    else if (yl & y_next)
+        yllimit = 0;
+    else
+        yllimit = (yl & y_mask) < state[wid].clip.yl;
+    yllimit = yllimit ? yl : state[wid].clip.yl;
+
+    int ylfar = yllimit | row_mask;
+    if ((yl >> 2) > (ylfar >> 2))
+        ylfar += 4;
+    else if ((yllimit >> 2) >= 0 && (yllimit >> 2) < (int)(1024 * al_scale) - 1)
+        state[wid].span[(yllimit >> 2) + 1].validline = 0;
+
+
+    if (yh & y_top)
+        yhlimit = 0;
+    else if (yh & y_next)
+        yhlimit = 1;
+    else
+        yhlimit = (yh >= state[wid].clip.yh);
+    yhlimit = yhlimit ? yh : state[wid].clip.yh;
+
+    int yhclose = yhlimit & ~row_mask;
+
+    int32_t clipxlshift = state[wid].clip.xl << 1;
+    int32_t clipxhshift = state[wid].clip.xh << 1;
+    const int32_t x_top   = 0x2000 << al_scale_log2;
+    const int32_t x_mask  = x_top - 1;
+    const int32_t x_field = (0x4000 << al_scale_log2) - 2; /* bits 1..13+log2 */
+    /* the narrower field the scissor-under compare reads: bits 1..12 at
+     * 1x. Left unscaled it wraps once an edge passes 1024 pixels of the
+     * finer grid, and an edge right of that then compares as left of a
+     * non-zero scissor XH and is pulled onto it. */
+    const int32_t x_under = (0x2000 << al_scale_log2) - 2;
+    const int32_t x_pix   = (0x1000 << al_scale_log2) - 1;  /* span endpoint, in pixels */
+    const int32_t x_cross = (0x3fff << al_scale_log2) << 14; /* edge-cross compare field */
+    /* the coordinate's sign and overflow bits: 27 and 26 at 1x */
+    const int32_t x_sign  = 0x8000000 << al_scale_log2;
+    const int32_t x_over  = 0x4000000 << al_scale_log2;
+    int allover = 1, allunder = 1, curover = 0, curunder = 0;
+    int allinval = 1;
+    int32_t curcross = 0;
+
+    xfrac = ((xright >> 8) & 0xff);
+
+
+    /* Each lane walks only the lines it owns (j % stride == offset), the
+     * others just get validline cleared. The edge and attribute DDAs are
+     * 32-bit additions per subline, so their state at any subline is the
+     * start plus a multiple of the step, exactly as the walk would have
+     * left it: EDGE_SEEK() lands on the first subline of an owned line
+     * and the four sublines then run as before. The minor edge switches
+     * from xm to xl at ym only when the walk reaches ym, which the seek
+     * mirrors by branching on ym lying at or below the sought subline. */
+    const int32_t xleft0 = xleft, xright0 = xright, xleft_inc0 = xleft_inc;
+    const int jcur = ycur >> 2, jfar = ylfar >> 2, jclose = yhclose >> 2;
+#define EDGE_SEEK(kk)                                                            \
+{                                                                                \
+    uint32_t nk = (uint32_t)((kk) - ycur);                                       \
+    xright = (int32_t)((uint32_t)xright0 + nk * (uint32_t)xright_inc);           \
+    if (ym >= ycur && (kk) >= ym)                                                \
+    {                                                                            \
+        xleft_inc = (dxldy >> 2) & ~1;                                           \
+        xleft = (int32_t)((uint32_t)(xl & ~1)                                    \
+              + (uint32_t)((kk) - ym) * (uint32_t)xleft_inc);                    \
+    }                                                                            \
+    else                                                                         \
+    {                                                                            \
+        xleft_inc = xleft_inc0;                                                  \
+        xleft = (int32_t)((uint32_t)xleft0 + nk * (uint32_t)xleft_inc0);         \
+    }                                                                            \
+    SEEK_ATTR_PRIM(j - jcur);                                                    \
+}
+#define LANE_OWNS_LINE(jj) \
+    (!state[wid].stride || (jj) % state[wid].stride == state[wid].offset)
+
+    if (flip)
+    {
+    for (j = jcur; j <= jfar; j++)
+    {
+        if (!LANE_OWNS_LINE(j))
+        {
+            if (j >= jclose)
+                state[wid].span[j].validline = 0;
+            continue;
+        }
+        k = j << 2;
+        EDGE_SEEK(k);
+    for (spix = 0; spix < 4; spix++, k++)
+    {
+        if (k == ym)
+        {
+
+            xleft = xl & ~1;
+            xleft_inc = (dxldy >> 2) & ~1;
+        }
+
+        if (k >= yhclose)
+        {
+            invaly = k < yhlimit || k >= yllimit;
+
+            if (spix == 0)
+            {
+                maxxmx = 0;
+                minxhx = x_pix;
+                allover = allunder = 1;
+                allinval = 1;
+            }
+
+            stickybit = ((xright >> 1) & 0x1fff) > 0;
+            xrsc = ((xright >> 13) & x_under) | stickybit;
+
+
+            curunder = ((xright & x_sign) || (xrsc < clipxhshift && !(xright & x_over)));
+
+            xrsc = curunder ? clipxhshift : (((xright >> 13) & x_field) | stickybit);
+            curover = ((xrsc & x_top) || (xrsc & x_mask) >= clipxlshift);
+            xrsc = curover ? clipxlshift : xrsc;
+            state[wid].span[j].majorx[spix] = xrsc & x_mask;
+            allover &= curover;
+            allunder &= curunder;
+
+            stickybit = ((xleft >> 1) & 0x1fff) > 0;
+            xlsc = ((xleft >> 13) & x_under) | stickybit;
+            curunder = ((xleft & x_sign) || (xlsc < clipxhshift && !(xleft & x_over)));
+            xlsc = curunder ? clipxhshift : (((xleft >> 13) & x_field) | stickybit);
+            curover = ((xlsc & x_top) || (xlsc & x_mask) >= clipxlshift);
+            xlsc = curover ? clipxlshift : xlsc;
+            state[wid].span[j].minorx[spix] = xlsc & x_mask;
+            allover &= curover;
+            allunder &= curunder;
+
+
+
+            curcross = ((xleft ^ x_sign) & x_cross) < ((xright ^ x_sign) & x_cross);
+
+
+            invaly |= curcross;
+            state[wid].span[j].invalyscan[spix] = invaly;
+            allinval &= invaly;
+
+            if (!invaly)
+            {
+                maxxmx = (((xlsc >> 3) & x_pix) > maxxmx) ? (xlsc >> 3) & x_pix : maxxmx;
+                minxhx = (((xrsc >> 3) & x_pix) < minxhx) ? (xrsc >> 3) & x_pix : minxhx;
+            }
+
+            if (spix == ldflag)
+            {
+
+
+
+
+                state[wid].span[j].unscrx = SIGN(xright >> 16, 12);
+                xfrac = (xright >> 8) & 0xff;
+                ADJUST_ATTR_PRIM();
+            }
+
+            if (spix == 3)
+            {
+                state[wid].span[j].lx = maxxmx;
+                state[wid].span[j].rx = minxhx;
+                state[wid].span[j].validline  = !allinval && !allover && !allunder && (!state[wid].scfield || (state[wid].scfield && !(state[wid].sckeepodd ^ (j & 1))));
+
+            }
+
+
+        }
+
+        xleft += xleft_inc;
+        xright += xright_inc;
+
+    }
+    }
+    }
+    else
+    {
+    for (j = jcur; j <= jfar; j++)
+    {
+        if (!LANE_OWNS_LINE(j))
+        {
+            if (j >= jclose)
+                state[wid].span[j].validline = 0;
+            continue;
+        }
+        k = j << 2;
+        EDGE_SEEK(k);
+    for (spix = 0; spix < 4; spix++, k++)
+    {
+        if (k == ym)
+        {
+            xleft = xl & ~1;
+            xleft_inc = (dxldy >> 2) & ~1;
+        }
+
+        if (k >= yhclose)
+        {
+            invaly = k < yhlimit || k >= yllimit;
+
+            if (spix == 0)
+            {
+                maxxhx = 0;
+                minxmx = x_pix;
+                allover = allunder = 1;
+                allinval = 1;
+            }
+
+            stickybit = ((xright >> 1) & 0x1fff) > 0;
+            xrsc = ((xright >> 13) & x_under) | stickybit;
+            curunder = ((xright & x_sign) || (xrsc < clipxhshift && !(xright & x_over)));
+            xrsc = curunder ? clipxhshift : (((xright >> 13) & x_field) | stickybit);
+            curover = ((xrsc & x_top) || (xrsc & x_mask) >= clipxlshift);
+            xrsc = curover ? clipxlshift : xrsc;
+            state[wid].span[j].majorx[spix] = xrsc & x_mask;
+            allover &= curover;
+            allunder &= curunder;
+
+            stickybit = ((xleft >> 1) & 0x1fff) > 0;
+            xlsc = ((xleft >> 13) & x_under) | stickybit;
+            curunder = ((xleft & x_sign) || (xlsc < clipxhshift && !(xleft & x_over)));
+            xlsc = curunder ? clipxhshift : (((xleft >> 13) & x_field) | stickybit);
+            curover = ((xlsc & x_top) || (xlsc & x_mask) >= clipxlshift);
+            xlsc = curover ? clipxlshift : xlsc;
+            state[wid].span[j].minorx[spix] = xlsc & x_mask;
+            allover &= curover;
+            allunder &= curunder;
+
+            curcross = ((xright ^ x_sign) & x_cross) < ((xleft ^ x_sign) & x_cross);
+
+            invaly |= curcross;
+            state[wid].span[j].invalyscan[spix] = invaly;
+            allinval &= invaly;
+
+            if (!invaly)
+            {
+                minxmx = (((xlsc >> 3) & x_pix) < minxmx) ? (xlsc >> 3) & x_pix : minxmx;
+                maxxhx = (((xrsc >> 3) & x_pix) > maxxhx) ? (xrsc >> 3) & x_pix : maxxhx;
+            }
+
+            if (spix == ldflag)
+            {
+                state[wid].span[j].unscrx  = SIGN(xright >> 16, 12);
+                xfrac = (xright >> 8) & 0xff;
+                ADJUST_ATTR_PRIM();
+            }
+
+            if (spix == 3)
+            {
+                state[wid].span[j].lx = minxmx;
+                state[wid].span[j].rx = maxxhx;
+                state[wid].span[j].validline  = !allinval && !allover && !allunder && (!state[wid].scfield || (state[wid].scfield && !(state[wid].sckeepodd ^ (j & 1))));
+            }
+
+        }
+
+        xleft += xleft_inc;
+        xright += xright_inc;
+
+    }
+    }
+    }
+#undef EDGE_SEEK
+#undef LANE_OWNS_LINE
+
+
+
+
+    switch(state[wid].other_modes.cycle_type)
+    {
+        case CYCLE_TYPE_1:
+            switch (state[wid].other_modes.f.textureuselevel0)
+            {
+                case 0: render_spans_1cycle_complete(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+                case 1: render_spans_1cycle_notexel1(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+                case 2: default: render_spans_1cycle_notex(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+            }
+            break;
+        case CYCLE_TYPE_2:
+            switch (state[wid].other_modes.f.textureuselevel1)
+            {
+                case 0: render_spans_2cycle_complete(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+                case 1: render_spans_2cycle_notexelnext(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+                case 2: render_spans_2cycle_notexel1(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+                case 3: default: render_spans_2cycle_notex(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+            }
+            break;
+        case CYCLE_TYPE_COPY: render_spans_copy(wid, yhlimit >> 2, yllimit >> 2, tilenum, flip); break;
+        case CYCLE_TYPE_FILL: render_spans_fill(wid, yhlimit >> 2, yllimit >> 2, flip); break;
+        default: msg_error("cycle_type %d", state[wid].other_modes.cycle_type); break;
+    }
+
+
+}
+
+static void rasterizer_init(uint32_t wid)
+{
+    state[wid].clip.xh = 0x2000;
+    state[wid].clip.yh = 0x2000;
+}
+
+/* A triangle without a z block still runs the z pipe whenever the
+ * othermode word enables it. The coefficient loader does not zero the z
+ * registers for such a triangle, nor keep the previous primitive's: it
+ * latches the triangle's own header doubleword into both z-block slots,
+ * so z = dzde = the first command word and dzdx = dzdy = the second.
+ * Hardware verified, diagnostic cartridge case 9:21 (carmiker/n64docs,
+ * RDP_TESTCART_HARDWARE.txt section 3.2). Rectangles are not covered
+ * by that capture and keep a zero z block. */
+#define TRI_LATCH_HEADER_Z(ew) \
+{ \
+    (ew)[40] = (ew)[0]; \
+    (ew)[41] = (ew)[1]; \
+    (ew)[42] = (ew)[0]; \
+    (ew)[43] = (ew)[1]; \
+}
+
+/* The shade block behaves the same way as the z block: a triangle
+ * without one still feeds the shade registers to the combiner, and the
+ * coefficient loader latches the triangle's own header doubleword into
+ * every one of the block's eight slots - integer and fraction parts of
+ * the colour, its x derivative, its edge derivative and its y
+ * derivative alike. Hardware verified: snapper64 "RDP Undefined Shade
+ * 1C", 64 of 64 hardware snapshots bit-exact. */
+#define TRI_LATCH_HEADER_SHADE(ew) \
+{ \
+    int latch_k; \
+    for (latch_k = 8; latch_k < 24; latch_k += 2) \
+    { \
+        (ew)[latch_k]     = (ew)[0]; \
+        (ew)[latch_k + 1] = (ew)[1]; \
+    } \
+}
+
+void rdp_tri_noshade(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 8 * sizeof(int32_t));
+    memset(&ewdata[24], 0, 16 * sizeof(int32_t));
+    TRI_LATCH_HEADER_SHADE(ewdata);
+    TRI_LATCH_HEADER_Z(ewdata);
+    edgewalker_for_prims(wid, ewdata);
+}
+
+void rdp_tri_noshade_z(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 8 * sizeof(int32_t));
+    memset(&ewdata[24], 0, 16 * sizeof(int32_t));
+    TRI_LATCH_HEADER_SHADE(ewdata);
+    memcpy(&ewdata[40], args + 8, 4 * sizeof(int32_t));
+    edgewalker_for_prims(wid, ewdata);
+}
+
+void rdp_tri_tex(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 8 * sizeof(int32_t));
+    TRI_LATCH_HEADER_SHADE(ewdata);
+    memcpy(&ewdata[24], args + 8, 16 * sizeof(int32_t));
+    TRI_LATCH_HEADER_Z(ewdata);
+    edgewalker_for_prims(wid, ewdata);
+}
+
+void rdp_tri_tex_z(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 8 * sizeof(int32_t));
+    TRI_LATCH_HEADER_SHADE(ewdata);
+    memcpy(&ewdata[24], args + 8, 16 * sizeof(int32_t));
+    memcpy(&ewdata[40], args + 24, 4 * sizeof(int32_t));
+
+
+
+
+
+
+    edgewalker_for_prims(wid, ewdata);
+
+
+}
+
+void rdp_tri_shade(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 24 * sizeof(int32_t));
+    memset(&ewdata[24], 0, 16 * sizeof(int32_t));
+    TRI_LATCH_HEADER_Z(ewdata);
+    edgewalker_for_prims(wid, ewdata);
+}
+
+void rdp_tri_shade_z(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 24 * sizeof(int32_t));
+    memset(&ewdata[24], 0, 16 * sizeof(int32_t));
+    memcpy(&ewdata[40], args + 24, 4 * sizeof(int32_t));
+    edgewalker_for_prims(wid, ewdata);
+}
+
+void rdp_tri_texshade(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, 40 * sizeof(int32_t));
+    TRI_LATCH_HEADER_Z(ewdata);
+    edgewalker_for_prims(wid, ewdata);
+}
+
+void rdp_tri_texshade_z(uint32_t wid, const uint32_t* args)
+{
+    int32_t ewdata[CMD_MAX_INTS];
+    memcpy(&ewdata[0], args, CMD_MAX_SIZE);
+
+
+
+
+
+    edgewalker_for_prims(wid, ewdata);
+
+
+}
+
+void rdp_tex_rect(uint32_t wid, const uint32_t* args)
+{
+    uint32_t tilenum    = (args[1] >> 24) & 0x7;
+    uint32_t xl = (args[0] >> 12) & 0xfff;
+    uint32_t yl = (args[0] >>  0) & 0xfff;
+    uint32_t xh = (args[1] >> 12) & 0xfff;
+    uint32_t yh = (args[1] >>  0) & 0xfff;
+
+    int32_t s = (args[2] >> 16) & 0xffff;
+    int32_t t = (args[2] >>  0) & 0xffff;
+    int32_t dsdx = (args[3] >> 16) & 0xffff;
+    int32_t dtdy = (args[3] >>  0) & 0xffff;
+
+    dsdx = SIGN16(dsdx);
+    dtdy = SIGN16(dtdy);
+
+    if (state[wid].other_modes.cycle_type == CYCLE_TYPE_FILL || state[wid].other_modes.cycle_type == CYCLE_TYPE_COPY)
+        yl |= 3;
+
+    uint32_t xlint = (xl >> 2) & 0x3ff;
+    uint32_t xhint = (xh >> 2) & 0x3ff;
+
+    int32_t ewdata[CMD_MAX_INTS];
+    ewdata[0] = (0x24 << 24) | ((0x80 | tilenum) << 16) | yl;
+    ewdata[1] = (yl << 16) | yh;
+    ewdata[2] = (xlint << 16) | ((xl & 3) << 14);
+    ewdata[3] = 0;
+    ewdata[4] = (xhint << 16) | ((xh & 3) << 14);
+    ewdata[5] = 0;
+    ewdata[6] = (xlint << 16) | ((xl & 3) << 14);
+    ewdata[7] = 0;
+    memset(&ewdata[8], 0, 16 * sizeof(uint32_t));
+    ewdata[24] = (s << 16) | t;
+    ewdata[25] = 0;
+    ewdata[26] = ((dsdx >> 5) << 16);
+    ewdata[27] = 0;
+    ewdata[28] = 0;
+    ewdata[29] = 0;
+    ewdata[30] = ((dsdx & 0x1f) << 11) << 16;
+    ewdata[31] = 0;
+    ewdata[32] = (dtdy >> 5) & 0xffff;
+    ewdata[33] = 0;
+    ewdata[34] = (dtdy >> 5) & 0xffff;
+    ewdata[35] = 0;
+    ewdata[36] = (dtdy & 0x1f) << 11;
+    ewdata[37] = 0;
+    ewdata[38] = (dtdy & 0x1f) << 11;
+    ewdata[39] = 0;
+    memset(&ewdata[40], 0, 4 * sizeof(int32_t));
+
+
+
+    edgewalker_for_prims(wid, ewdata);
+
+}
+
+void rdp_tex_rect_flip(uint32_t wid, const uint32_t* args)
+{
+    uint32_t tilenum    = (args[1] >> 24) & 0x7;
+    uint32_t xl = (args[0] >> 12) & 0xfff;
+    uint32_t yl = (args[0] >>  0) & 0xfff;
+    uint32_t xh = (args[1] >> 12) & 0xfff;
+    uint32_t yh = (args[1] >>  0) & 0xfff;
+
+    int32_t s = (args[2] >> 16) & 0xffff;
+    int32_t t = (args[2] >>  0) & 0xffff;
+    int32_t dsdx = (args[3] >> 16) & 0xffff;
+    int32_t dtdy = (args[3] >>  0) & 0xffff;
+
+    dsdx = SIGN16(dsdx);
+    dtdy = SIGN16(dtdy);
+
+    if (state[wid].other_modes.cycle_type == CYCLE_TYPE_FILL || state[wid].other_modes.cycle_type == CYCLE_TYPE_COPY)
+        yl |= 3;
+
+    uint32_t xlint = (xl >> 2) & 0x3ff;
+    uint32_t xhint = (xh >> 2) & 0x3ff;
+
+    int32_t ewdata[CMD_MAX_INTS];
+    ewdata[0] = (0x25 << 24) | ((0x80 | tilenum) << 16) | yl;
+    ewdata[1] = (yl << 16) | yh;
+    ewdata[2] = (xlint << 16) | ((xl & 3) << 14);
+    ewdata[3] = 0;
+    ewdata[4] = (xhint << 16) | ((xh & 3) << 14);
+    ewdata[5] = 0;
+    ewdata[6] = (xlint << 16) | ((xl & 3) << 14);
+    ewdata[7] = 0;
+    memset(&ewdata[8], 0, 16 * sizeof(int32_t));
+    ewdata[24] = (s << 16) | t;
+    ewdata[25] = 0;
+
+    ewdata[26] = (dtdy >> 5) & 0xffff;
+    ewdata[27] = 0;
+    ewdata[28] = 0;
+    ewdata[29] = 0;
+    ewdata[30] = ((dtdy & 0x1f) << 11);
+    ewdata[31] = 0;
+    ewdata[32] = (dsdx >> 5) << 16;
+    ewdata[33] = 0;
+    ewdata[34] = (dsdx >> 5) << 16;
+    ewdata[35] = 0;
+    ewdata[36] = (dsdx & 0x1f) << 27;
+    ewdata[37] = 0;
+    ewdata[38] = (dsdx & 0x1f) << 27;
+    ewdata[39] = 0;
+    memset(&ewdata[40], 0, 4 * sizeof(int32_t));
+
+    edgewalker_for_prims(wid, ewdata);
+}
+
+/* Span-buffer stale-read hazard, back-to-back identical rectangles.
+ *
+ * Without atomic_prim the command processor runs ahead of the pixel
+ * pipeline by the lead D of the no-sync model (n64video.c), and a span
+ * costs L clocks. When D exceeds L, a rectangle's framebuffer reads
+ * precede its predecessor's commit of the same pixels and return the
+ * memory image from before the predecessor, so repeated blends of one
+ * pixel advance only every other primitive. atomic_prim stalls the
+ * processor per primitive and restores sequential reads.
+ *
+ * Model and scope are cen64's (rdp_fill_rect_stale_read), adjudicated
+ * there against the diagnostic cartridge's cases 12:15 and 12:16:
+ * identical single-live-row 1-/2-cycle rectangles issued back to back
+ * with image_read_en on a 16-bit colour image. The successor is drawn
+ * over the predecessor's pre-image, and the predecessor's output becomes
+ * the pre-image of the rectangle after that. Only the lane that owns the
+ * row touches memory. Returns whether this rectangle is a stale reader. */
+static int fill_rect_stale_pre(uint32_t wid, const uint32_t* args, uint16_t *cur)
+{
+    const uint32_t xl = (args[0] >> 12) & 0xfff, yl = args[0] & 0xfff;
+    const uint32_t xh = (args[1] >> 12) & 0xfff, yh = args[1] & 0xfff;
+    const uint32_t W = (xl >> 2) - (xh >> 2), H = (yl >> 2) - (yh >> 2);
+    const int cyc = state[wid].other_modes.cycle_type;
+    const uint32_t cycn = (cyc == CYCLE_TYPE_2) ? 2 : 1;
+    uint32_t L = cycn * W + cycn - 1, D, i;
+    const uint32_t y0 = yh >> 2;
+    int eligible, owner;
+
+    if (L < 4) L = 4;
+    D = (3 * L - 2 < 25) ? 3 * L - 2 : 25;
+    eligible = (cyc == CYCLE_TYPE_1 || cyc == CYCLE_TYPE_2)
+        && state[wid].other_modes.image_read_en && !state[wid].other_modes.atomic_prim
+        && xl >= xh && yl >= yh && H == 1 && W >= 1 && W <= 32 && D > L
+        && state[wid].fb_size == PIXEL_SIZE_16BIT && al_scale == 1;
+    if (!eligible)
+    {
+        state[wid].rect_stale.valid = 0;
+        return 0;
+    }
+    owner = !state[wid].stride || y0 % state[wid].stride == state[wid].offset;
+
+    if (state[wid].rect_stale.valid && state[wid].rect_stale.n
+        && state[wid].rect_stale.w0 == args[0] && state[wid].rect_stale.w1 == args[1])
+    {
+        if (owner)
+            for (i = 0; i < state[wid].rect_stale.n; i++)
+            {
+                uint16_t v;
+                RREADIDX16(v, state[wid].rect_stale.idx[i]);
+                cur[i] = v;
+                RWRITEIDX16(state[wid].rect_stale.idx[i], state[wid].rect_stale.pre[i]);
+            }
+        return 1;
+    }
+
+    state[wid].rect_stale.n = (uint8_t)W;
+    for (i = 0; i < W; i++)
+    {
+        uint16_t v = 0;
+        state[wid].rect_stale.idx[i] = (state[wid].fb_address >> 1) + y0 * state[wid].fb_width + (xh >> 2) + i;
+        if (owner)
+            RREADIDX16(v, state[wid].rect_stale.idx[i]);
+        state[wid].rect_stale.pre[i] = v;
+    }
+    state[wid].rect_stale.w0 = args[0];
+    state[wid].rect_stale.w1 = args[1];
+    state[wid].rect_stale.valid = 1;
+    return 0;
+}
+
+void rdp_fill_rect(uint32_t wid, const uint32_t* args)
+{
+    uint32_t xl = (args[0] >> 12) & 0xfff;
+    uint32_t yl = (args[0] >>  0) & 0xfff;
+    uint32_t xh = (args[1] >> 12) & 0xfff;
+    uint32_t yh = (args[1] >>  0) & 0xfff;
+    uint16_t stale_cur[32] = {0};
+    int stale = fill_rect_stale_pre(wid, args, stale_cur);
+
+    if (state[wid].other_modes.cycle_type == CYCLE_TYPE_FILL || state[wid].other_modes.cycle_type == CYCLE_TYPE_COPY)
+        yl |= 3;
+
+    uint32_t xlint = (xl >> 2) & 0x3ff;
+    uint32_t xhint = (xh >> 2) & 0x3ff;
+
+    int32_t ewdata[CMD_MAX_INTS];
+    ewdata[0] = (0x3680 << 16) | yl;
+    ewdata[1] = (yl << 16) | yh;
+    ewdata[2] = (xlint << 16) | ((xl & 3) << 14);
+    ewdata[3] = 0;
+    ewdata[4] = (xhint << 16) | ((xh & 3) << 14);
+    ewdata[5] = 0;
+    ewdata[6] = (xlint << 16) | ((xl & 3) << 14);
+    ewdata[7] = 0;
+    memset(&ewdata[8], 0, 36 * sizeof(int32_t));
+
+    edgewalker_for_prims(wid, ewdata);
+
+    /* chain: the next stale reader sees this rectangle's pre-image, which
+     * is the predecessor's output saved above */
+    if (stale)
+    {
+        uint32_t k;
+        for (k = 0; k < state[wid].rect_stale.n; k++)
+            state[wid].rect_stale.pre[k] = stale_cur[k];
+    }
+}
+
+void rdp_set_prim_depth(uint32_t wid, const uint32_t* args)
+{
+    state[wid].primitive_z = args[1] & (0x7fff << 16);
+
+
+    state[wid].primitive_delta_z = (uint16_t)(args[1]);
+}
+
+void rdp_set_scissor(uint32_t wid, const uint32_t* args)
+{
+    state[wid].clip.xh = ((args[0] >> 12) & 0xfff) * al_scale;
+    state[wid].clip.yh = ((args[0] >>  0) & 0xfff) * al_scale;
+    state[wid].clip.xl = ((args[1] >> 12) & 0xfff) * al_scale;
+    state[wid].clip.yl = ((args[1] >>  0) & 0xfff) * al_scale;
+
+    state[wid].scfield = (args[1] >> 25) & 1;
+    state[wid].sckeepodd = (args[1] >> 24) & 1;
+}

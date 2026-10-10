@@ -1,0 +1,11 @@
+PS5N64 v2 verification (AI-assisted)
+Public PS5 target: real ParaLLEl N64 cached interpreter and Angrylion core, 147 compiled objects.
+Host tests passed: original generated MIPS cartridge framebuffer, native-rate audio DMA,
+analog/C-button input, battery save persistence, save-state memory restoration and second-ROM start.
+z64/v64/n64 normalization, Stored/Deflate ZIP, invalid ZIP rejection and warm library cache passed.
+Cover tests passed: regional filename matching, accents, real repository JPEG download/decode, fallback caching and stale 404 recovery.
+Actual Vulkan shelf/controller pane and raw RGB image shader rendered and inspected on host.
+Native flexible/internal memory parameters and signed executable container integrity checked by build.
+ZIP CRC, file SHA256, source fingerprints, app ID, helper target, N64 icon and core notices verified.
+Separate PPSA99206 and /data/PS5N64; PS5SNES remains separate.
+No commercial ROMs or firmware included. NOT tested on PS5 hardware: full speed and game compatibility need user testing.

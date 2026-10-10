@@ -1,0 +1,3574 @@
+#include <stdio.h>
+#include <mupen64plus-next_common.h>
+
+/* libretro-fork compat: legacy CONT_* controller-presence + M64CMD_DDROM_OPEN +
+ * mempak format defaults, retained for the fork's libretro glue (next dropped
+ * these names but the underlying values are unchanged). */
+#ifndef CONT_NONE
+#define CONT_NONE     0
+#define CONT_JOYPAD   1
+#define CONT_MOUSE    2
+#define CONT_GCN      4
+#endif
+#ifndef M64CMD_DDROM_OPEN
+#define M64CMD_DDROM_OPEN 25
+#endif
+#ifndef DEFAULT_MEMPAK_DEVICEID
+#define DEFAULT_MEMPAK_DEVICEID 0x0500
+#define DEFAULT_MEMPAK_BANKS    1
+#define DEFAULT_MEMPAK_VERSION  0
+#endif
+
+uint8_t* g_dd_disk;
+#include <stdlib.h>
+#include <string.h>
+
+#include <libretro.h>
+#include <streams/file_stream.h>
+#include <file/file_path.h>
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#include <glsm/glsmsym.h>
+#endif
+
+#include "api/m64p_frontend.h"
+#include "plugin/plugin.h"
+#include "api/m64p_types.h"
+/* region 14 / Phase 2d (increment 9): mupencorestop is aliased to
+ * g_dev.r4300.new_dynarec_hot_state.stop on x64 (see r4300.h); this TU uses it,
+ * so it needs the complete struct device (main.h alone only forward-declares
+ * g_dev). */
+#include "device/device.h"
+#include "device/r4300/r4300.h"
+#include "device/memory/m64p_memory.h"
+#include "main/main.h"
+#include "main/cheat.h"
+#include "main/version.h"
+#include "main/savestates.h"
+#include "device/dd/disk.h"
+#include "device/rcp/pi/pi_controller.h"
+#include "device/pif/pif.h"
+#include "device/pif/cic.h"
+#include "main/rom.h"
+#include "libretro_memory.h"
+#include "libretro_core_options.h"
+
+/* Cxd4 RSP */
+#include "../mupen64plus-rsp-cxd4/config.h"
+#include "plugin/audio_libretro/audio_plugin.h"
+#include "device/rcp/ai/ai_controller.h"
+#include "../mupen64plus-rsp-hle/src/resample_hq.h"
+#include "../Graphics/plugin.h"
+
+#ifdef HAVE_THR_AL
+#include "../mupen64plus-video-angrylion/vdac.h"
+#endif
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#include <glsm/glsmsym.h>
+#else
+/* Targets built without a GL renderer - iOS, for one - still need a glsm_ctl
+ * for the callers below. glsmsym.h cannot be included for it: its prototypes
+ * are desktop-GL typed (GLclampd, GLdouble), and glsm.h only supplies those
+ * typedefs when one of the HAVE_OPENGLES* defines is set, while the headers
+ * rglgen pulls in on iOS are ES ones that do not carry them. glsm.h alone is
+ * enough here - the stub needs the enum and nothing else. */
+#include <glsm/glsm_state_ctl.h> /* (AI-assisted) Software builds only need the enum; no GL header. */
+bool glsm_ctl(enum glsm_state_ctl state, void *data) { return false; }
+#endif
+
+#ifndef PRESCALE_WIDTH
+#define PRESCALE_WIDTH  640
+#endif
+
+#ifndef PRESCALE_HEIGHT
+#define PRESCALE_HEIGHT 625
+#endif
+
+
+/* forward declarations */
+int InitGfx(void);
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+int glide64InitGfx(void);
+void gles2n64_reset(void);
+#endif
+#if defined(HAVE_RICE)
+extern int  riceRomOpen(void);
+extern void riceRomClosed(void);
+#endif
+
+#if defined(HAVE_PARALLEL)
+#include "../mupen64plus-video-paraLLEl/parallel.h"
+
+static struct retro_hw_render_callback hw_render;
+static struct retro_hw_render_context_negotiation_interface_vulkan hw_context_negotiation;
+static const struct retro_hw_render_interface_vulkan *vulkan;
+#endif
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+/* aleck64_e90_gl.c: composites the E90 sprite overlay on the GPU */
+void aleck64_e90_gl_draw(unsigned out_width, unsigned out_height);
+void aleck64_e90_gl_context_reset(void);
+void aleck64_e90_gl_destroy(void);
+#else
+#define aleck64_e90_gl_draw(w, h) ((void)0)
+#define aleck64_e90_gl_context_reset() ((void)0)
+#define aleck64_e90_gl_destroy() ((void)0)
+#endif
+
+#define ISHEXDEC ((codeLine[cursor]>='0') && (codeLine[cursor]<='9')) || ((codeLine[cursor]>='a') && (codeLine[cursor]<='f')) || ((codeLine[cursor]>='A') && (codeLine[cursor]<='F'))
+
+/* Forward declarations.
+ * inputGetKeys_default_descriptor lives in
+ * mupen64plus-core/src/plugin/emulate_game_controller_via_libretro.c
+ * and re-publishes the libretro input descriptors based on the current
+ * value of alternate_mapping. Called from update_variables() so a flip
+ * of the alt-map core option takes effect without restarting the core.
+ */
+extern void inputGetKeys_default_descriptor(void);
+
+struct retro_perf_callback perf_cb;
+retro_get_cpu_features_t perf_get_cpu_features_cb = NULL;
+
+retro_log_printf_t log_cb                         = NULL;
+retro_video_refresh_t video_cb                    = NULL;
+retro_input_poll_t poll_cb                        = NULL;
+retro_input_state_t input_cb                      = NULL;
+retro_audio_sample_batch_t audio_batch_cb         = NULL;
+uint32_t CountPerScanlineOverride = 0;
+retro_environment_t environ_cb                    = NULL;
+/* mupen64plus-next core globals consumed by the adopted main.c/rom.c */
+uint32_t CountPerOp = 0;
+/* ari64: alias GoldenEye's demand-paged segment onto the ROM (see
+ * tlb_speed_hacks). Read at startup; applied at dynarec init and on
+ * savestate load. */
+int goldeneye_tlb_hack = 1;
+uint32_t CountPerOpDenomPot = 0;
+uint32_t ForceDisableExtraMem = 0;
+uint32_t EnableThreadedRenderer = 0;
+char* retro_dd_path_img = NULL;
+char* retro_dd_path_rom = NULL;
+/* fork-specific frame/sync globals (declared extern above; defined here) */
+int frame_break = 0;
+int g_count_per_scanline = 0;
+int g_force_parallel_sync = 0;
+/* controller c-button state + transferpak paths (next libretro globals) */
+int r_cbutton, l_cbutton, d_cbutton, u_cbutton;
+char* retro_transferpak_rom_path = NULL;
+char* retro_transferpak_ram_path = NULL;
+
+/* fork 64DD: a fresh disk image is an empty (zeroed) buffer; the IPL writes
+ * its own structure on first use. next has no format_disk, so define it here. */
+void format_disk(uint8_t* disk)
+{
+   if (disk) memset(disk, 0, 0x0435B0C0);
+}
+uint32_t IgnoreTLBExceptions = 0;
+
+/* Implemented in mupen64plus-core/src/plugin/audio_libretro/
+ * audio_backend_libretro.c. flush_audio_libretro drains the per-frame
+ * accumulator into a single audio_batch_cb at end-of-retro_run;
+ * get_audio_sample_rate_libretro returns the most recent rate the N64
+ * game requested via MTC0 of AI_DACRATE_REG, or a sane default before
+ * the game's first AI write. */
+extern void     init_audio_libretro(void);
+extern void     deinit_audio_libretro(void);
+extern void     flush_audio_libretro(void);
+extern double   get_audio_sample_rate_libretro(void);
+
+struct retro_rumble_interface rumble;
+
+#define SUBSYSTEM_CART_DISK 0x0101
+
+static const struct retro_subsystem_rom_info n64_cart_disk[] = {
+   { "Cartridge", "n64|z64|v64|bin", false, false, false, NULL, 0 },
+   { "Disk",      "ndd|bin",         false, false, false, NULL, 0 },
+   { NULL }
+};
+
+static const struct retro_subsystem_info subsystems[] = {
+   { "Cartridge and Disk", "n64_cart_disk", n64_cart_disk, 2, SUBSYSTEM_CART_DISK},
+   { NULL }
+};
+
+save_memory_data saved_memory;
+
+static bool stop_stepping;
+extern unsigned int r4300_emumode;
+extern unsigned int r4300_jit_backend;
+int g_real_stop = 0; /* genuine emulation stop, vs per-frame mupencorestop yield */
+/* Set while content is being torn down (retro_unload_game), cleared on the
+ * next load (retro_load_game). Unlike g_real_stop it has a per-content
+ * lifecycle, and unlike mupencorestop it is not toggled every frame. The RSP
+ * plugin's run loop polls it so a stale task cannot spin forever in the
+ * close-content EmuThreadStep(): parallel-rsp's DoRspCycles otherwise loops
+ * until SP_STATUS_HALT, which a torn-down task never reaches. */
+int g_rsp_force_halt = 0;
+extern int frame_break; /* r4300: unwinds the CPU cores at the frame boundary */
+
+float polygonOffsetFactor           = 0.0f;
+float polygonOffsetUnits            = 0.0f;
+
+static bool vulkan_inited           = false;
+static bool gl_inited               = false;
+
+int astick_deadzone                       = 0;
+int astick_snap_active                    = 0;
+int astick_snap_max_angle                 = 15;
+int astick_snap_min_displacement_percent  = 70;
+int astick_sensitivity                    = 100;
+int first_time                            = 1;
+static bool frame_latched                 = false; /* a renderer finished a frame this slice */
+
+static uint8_t* cart_data           = NULL;
+static uint32_t cart_size           = 0;
+static uint8_t* disk_data           = NULL;
+static uint32_t disk_size           = 0;
+/* Set from the 64DD Hardware core option, read at content load. */
+static bool     dd_hardware         = false;
+
+static bool     emu_initialized     = false;
+static unsigned initial_boot        = true;
+
+static unsigned retro_filtering     = 0;
+static unsigned retro_dithering     = 0;
+static bool     reinit_screen       = false;
+static bool     first_context_reset = false;
+static bool     context_setup_first_init = false;
+
+
+/* Set per retro_run from RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE: nonzero
+ * means the frontend will discard this frame's video (a run-ahead "future"
+ * frame or a rewind re-simulation).  Consulted only in emu_step_render to
+ * withhold the final video_cb on such frames; the renderers themselves run
+ * unchanged so no display state desyncs and save/load stays correct. */
+int frame_hidden                    = 0;
+
+uint32_t gfx_plugin_accuracy        = 2;
+static enum fork_rsp_plugin_type
+                 rsp_plugin;
+uint32_t screen_width               = 640;
+uint32_t screen_height              = 480;
+float    screen_aspect_ratio        = 4.0 / 3.0;
+uint32_t screen_pitch               = 0;
+/* the buffer angrylion last presented: its fixed one at 1x, its upscaled one otherwise */
+const void *screen_pixels           = NULL;
+uint32_t screen_aspectmodehint;
+enum audio_rsp_mode_t audio_rsp_mode = AUDIO_RSP_FOLLOW;
+/* Set from the ROM header for titles whose audio microcode use cannot be
+ * HLE'd faithfully; consulted by plugin_rsp_init (plugin.c). */
+unsigned int FAKE_SDL_TICKS         = 0;
+
+bool alternate_mapping;
+bool mouse_mode;
+int mouse_sensitivity_x;
+int mouse_sensitivity_y;
+int mouse_left_btn;
+int mouse_right_btn;
+int mouse_middle_btn;
+int mouse_wheel_up_btn;
+int mouse_wheel_down_btn;
+
+static bool initializing            = true;
+
+extern int g_count_per_scanline;
+
+static char rdp_plugin_last[32] = {0};
+
+uint32_t CoreOptionCategoriesSupported = 0;
+uint32_t CoreOptionUpdateDisplayCbSupported = 0;
+
+uint32_t bilinearMode = 0;
+uint32_t EnableHWLighting = 0;
+uint32_t CorrectTexrectCoords = 0;
+uint32_t EnableInaccurateTextureCoordinates = 0;
+uint32_t enableNativeResTexrects = 0;
+uint32_t enableLegacyBlending = 0;
+uint32_t EnableCopyColorToRDRAM = 0;
+uint32_t EnableCopyColorFromRDRAM = 0;
+uint32_t EnableCopyDepthToRDRAM = 0;
+uint32_t AspectRatio = 0;
+uint32_t txFilterMode = 0;
+uint32_t txEnhancementMode = 0;
+uint32_t txHiresEnable = 0;
+uint32_t txHiresFullAlphaChannel = 0;
+uint32_t txFilterIgnoreBG = 0;
+uint32_t EnableFXAA = 0;
+uint32_t MultiSampling = 0;
+uint32_t EnableFragmentDepthWrite = 0;
+uint32_t EnableShadersStorage = 0;
+uint32_t EnableTextureCache = 0;
+uint32_t EnableFBEmulation = 0;
+uint32_t EnableLODEmulation = 0;
+uint32_t BackgroundMode = 0; // 0 is bgOnePiece
+uint32_t EnableHiResAltCRC = 0;
+uint32_t EnableTxCacheCompression = 0;
+uint32_t EnableNativeResFactor = 0;
+uint32_t EnableN64DepthCompare = 0;
+uint32_t EnableCopyAuxToRDRAM = 0;
+uint32_t GLideN64IniBehaviour = 0;
+
+uint32_t EnableOverscan = 0;
+uint32_t OverscanTop = 0;
+uint32_t OverscanLeft = 0;
+uint32_t OverscanRight = 0;
+uint32_t OverscanBottom = 0;
+
+uint32_t AllowUnalignedDMA = 1;
+uint32_t AllowLargeRoms = 1;
+uint32_t LegacySm64ToolsHacks = 0;
+uint32_t RemoveFBBlackBars = 0;
+uint32_t OverrideSaveType = 0;
+uint32_t SdCardEmulationEnabled = 0;
+uint32_t RollbackRtcOnLoadState = 0;
+
+/* after the controller's CONTROL* member has been assigned we can update
+ * them straight from here... */
+extern struct
+{
+    CONTROL *control;
+    BUTTONS buttons;
+} controller[4];
+
+/* ...but it won't be at least the first time we're called, in that case set
+ * these instead for input_plugin to read. */
+int pad_pak_types[4];
+int pad_present[4] = {CONT_JOYPAD, CONT_JOYPAD, CONT_JOYPAD, CONT_JOYPAD};
+
+static void n64DebugCallback(void* aContext, int aLevel, const char* aMessage)
+{
+    char buffer[1024];
+    if (!log_cb)
+       return;
+
+    sprintf(buffer, "mupen64plus: %s\n", aMessage);
+
+    switch (aLevel)
+    {
+       case M64MSG_ERROR:
+          log_cb(RETRO_LOG_ERROR, buffer);
+          break;
+       case M64MSG_INFO:
+          log_cb(RETRO_LOG_INFO, buffer);
+          break;
+       case M64MSG_WARNING:
+          log_cb(RETRO_LOG_WARN, buffer);
+          break;
+       case M64MSG_VERBOSE:
+       case M64MSG_STATUS:
+          log_cb(RETRO_LOG_DEBUG, buffer);
+          break;
+       default:
+          break;
+    }
+}
+
+extern m64p_rom_header ROM_HEADER;
+extern int g_force_parallel_sync;
+
+static void core_settings_autoselect_gfx_plugin(void)
+{
+   struct retro_variable gfx_var = { "parallel-n64-gfxplugin", 0 };
+
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &gfx_var);
+
+   if (gfx_var.value && strcmp(gfx_var.value, "auto") != 0)
+      return;
+
+#if defined(HAVE_PARALLEL)
+   /* The E90 sprite overlay is composited by the software and GL renderers
+    * only, so an E90 board would lose its playfield under parallel-RDP. */
+   if (vulkan_inited && !g_aleck64_e90)
+   {
+      gfx_plugin = GFX_PARALLEL;
+      return;
+   }
+#endif
+
+#if (defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)) && defined(HAVE_GLIDE64)
+   if (gl_inited)
+   {
+      gfx_plugin = GFX_GLIDE64;
+      return;
+   }
+#endif
+
+#ifdef HAVE_THR_AL
+   gfx_plugin = GFX_ANGRYLION;
+#endif
+}
+
+unsigned libretro_get_gfx_plugin(void)
+{
+   return gfx_plugin;
+}
+
+static void core_settings_autoselect_rsp_plugin(void);
+
+static void core_settings_set_defaults(void)
+{
+   /* Load GFX plugin core option */
+   struct retro_variable gfx_var = { "parallel-n64-gfxplugin", 0 };
+   struct retro_variable rsp_var = { "parallel-n64-rspplugin", 0 };
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &gfx_var);
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &rsp_var);
+
+   if (gfx_var.value)
+   {
+      if (gfx_var.value && !strcmp(gfx_var.value, "auto"))
+         core_settings_autoselect_gfx_plugin();
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#ifdef HAVE_GLN64
+      if (gfx_var.value && !strcmp(gfx_var.value, "gln64") && gl_inited)
+         gfx_plugin = GFX_GLN64;
+#endif
+
+#ifdef HAVE_GLIDEN64
+      if (gfx_var.value && !strcmp(gfx_var.value, "gliden64") && gl_inited)
+         gfx_plugin = GFX_GLIDEN64;
+#endif
+
+#ifdef HAVE_RICE
+      if (gfx_var.value && !strcmp(gfx_var.value, "rice") && gl_inited)
+         gfx_plugin = GFX_RICE;
+#endif
+#ifdef HAVE_GLIDE64
+      if(gfx_var.value && !strcmp(gfx_var.value, "glide64") && gl_inited)
+         gfx_plugin = GFX_GLIDE64;
+#endif
+#endif
+#ifdef HAVE_THR_AL
+	  if(gfx_var.value && !strcmp(gfx_var.value, "angrylion"))
+         gfx_plugin = GFX_ANGRYLION;
+#endif
+#ifdef HAVE_PARALLEL
+	  if(gfx_var.value && !strcmp(gfx_var.value, "parallel") && vulkan_inited)
+         gfx_plugin = GFX_PARALLEL;
+#endif
+   }
+
+   gfx_var.key = "parallel-n64-gfxplugin-accuracy";
+   gfx_var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &gfx_var) && gfx_var.value)
+   {
+       if (gfx_var.value && !strcmp(gfx_var.value, "veryhigh"))
+          gfx_plugin_accuracy = 3;
+       else if (gfx_var.value && !strcmp(gfx_var.value, "high"))
+          gfx_plugin_accuracy = 2;
+       else if (gfx_var.value && !strcmp(gfx_var.value, "medium"))
+          gfx_plugin_accuracy = 1;
+       else if (gfx_var.value && !strcmp(gfx_var.value, "low"))
+          gfx_plugin_accuracy = 0;
+   }
+
+   /* Load RSP plugin core option */
+
+   if (rsp_var.value)
+   {
+      if (rsp_var.value && !strcmp(rsp_var.value, "auto"))
+         core_settings_autoselect_rsp_plugin();
+      /* Honor an explicit HLE request on any backend.  The HLE RSP feeds the
+       * graphics plugin a display list; both angrylion and parallel-rdp can
+       * rasterize it (the latter via the shared HLE command emitter), so HLE
+       * is no longer OpenGL-only and is never overridden under Vulkan. */
+      if (rsp_var.value && !strcmp(rsp_var.value, "hle"))
+         rsp_plugin = RSP_HLE;
+      if (rsp_var.value && !strcmp(rsp_var.value, "cxd4"))
+         rsp_plugin = RSP_CXD4;
+      if (rsp_var.value && !strcmp(rsp_var.value, "parallel"))
+         rsp_plugin = RSP_PARALLEL;
+   }
+}
+
+
+
+static void core_settings_autoselect_rsp_plugin(void)
+{
+   struct retro_variable rsp_var = { "parallel-n64-rspplugin", 0 };
+
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &rsp_var);
+
+   if (rsp_var.value && strcmp(rsp_var.value, "auto") != 0)
+      return;
+
+   rsp_plugin = RSP_HLE;
+
+   /* No hardcoded RSP routing for Gauntlet Legends: rsp-hle detects its
+    * streaming microcode and serves it (angrylion), or declares itself
+    * unable and the task falls back to the LLE plugin (GLideN64). The old
+    * RSP_CXD4 override predated the streaming support and forced the one
+    * path that cannot work under either renderer. */
+
+   if (!strcmp((const char*)ROM_HEADER.Name, "CONKER BFD"))
+      rsp_plugin = RSP_HLE;
+
+   /* HLE only recognizes the SGI-toolchain microcodes that shipped with
+    * retail bootcode.  A cartridge whose IPL3 checksum is not in the CIC
+    * table is homebrew (libdragon's open-source IPL3 lands here), and its
+    * microcode - rspq, tiny3d - is guaranteed foreign to the HLE walker:
+    * under "auto" such content reset-looped without ever configuring the
+    * VI.  Route unknown-IPL3 carts to the LLE core; the Vulkan branch
+    * below upgrades that to the parallel RSP when available. */
+   {
+      const uint8_t* cart = (const uint8_t*)mem_base_u32(g_mem_base, MM_CART_ROM);
+      if (cart && g_rom_size >= 0x1000)
+      {
+         /* Autoselect runs from emu_step_initialize(), which is before
+          * main_run() byte-swaps the cartridge into host word order, so
+          * mem_base still holds the file's own order here.  cic_ipl3_known
+          * reads native uint32, and on a little-endian host that yields
+          * transposed words summing to a value no retail CIC matches: every
+          * cartridge looked like homebrew and went to the LLE core.  Sum a
+          * corrected copy instead of the live buffer. */
+         uint32_t ipl3[0xfc0/4];
+         memcpy(ipl3, cart + 0x40, sizeof(ipl3));
+#if !defined(MSB_FIRST)
+         if (!g_RomWordsLittleEndian)
+         {
+            size_t i;
+            for (i = 0; i < sizeof(ipl3)/sizeof(ipl3[0]); ++i)
+               ipl3[i] = ((ipl3[i] & UINT32_C(0x000000ff)) << 24)
+                       | ((ipl3[i] & UINT32_C(0x0000ff00)) <<  8)
+                       | ((ipl3[i] & UINT32_C(0x00ff0000)) >>  8)
+                       | ((ipl3[i] & UINT32_C(0xff000000)) >> 24);
+         }
+#endif
+         if (!cic_ipl3_known(ipl3))
+            rsp_plugin = RSP_CXD4;
+      }
+   }
+
+   /* Auto mode only: with Vulkan up the best default is the parallel RSP.
+    * This is the autoselect default; it does NOT override an explicit user
+    * choice (handled in the caller), so "hle" + parallel/Vulkan still works. */
+   if (vulkan_inited)
+   {
+#if defined(HAVE_PARALLEL_RSP)
+      rsp_plugin = RSP_PARALLEL;
+#else
+      rsp_plugin = RSP_CXD4;
+#endif
+   }
+
+}
+
+static bool set_variable_visibility(void)
+{
+    // For simplicity we create a prepared var per plugin, maybe create a macro for this?
+    struct retro_core_option_display option_display_gliden64;
+    struct retro_core_option_display option_display_angrylion;
+    struct retro_core_option_display option_display_parallel;
+    struct retro_core_option_display option_display_glide64;
+
+    size_t i;
+    size_t num_options = 0;
+    char **values_buf = NULL;
+    struct retro_variable var;
+    const char *rdp_plugin_current = "__NULL__";
+    bool rdp_plugin_found = false;
+
+    // If option categories are supported but
+    // the option update display callback is not,
+    // then all options should be shown,
+    // i.e. do nothing
+    if (CoreOptionCategoriesSupported && !CoreOptionUpdateDisplayCbSupported)
+        return false;
+
+    // Get current plugin
+    var.key = CORE_NAME "-gfxplugin";
+    var.value = NULL;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    {
+        rdp_plugin_current = var.value;
+        rdp_plugin_found = true;
+    }
+
+    // Check if plugin has changed since last
+    // call of this function
+    if (!strcmp(rdp_plugin_last, rdp_plugin_current))
+        return false;
+
+    strncpy(rdp_plugin_last, rdp_plugin_current, sizeof(rdp_plugin_last));
+
+    // Show/hide options depending on Plugins (Active isn't relevant!)
+    if (rdp_plugin_found)
+    {
+        option_display_gliden64.visible = !strcmp(rdp_plugin_current, "gliden64");
+        option_display_angrylion.visible = !strcmp(rdp_plugin_current, "angrylion");
+        option_display_parallel.visible = !strcmp(rdp_plugin_current, "parallel");
+        option_display_glide64.visible = !strcmp(rdp_plugin_current, "glide64");
+    } else {
+        option_display_gliden64.visible = option_display_angrylion.visible = option_display_parallel.visible = option_display_glide64.visible = true;
+    }
+
+    // Determine number of options
+    for (;;)
+    {
+        if (!option_defs_us[num_options].key)
+            break;
+        num_options++;
+    }
+
+    // Copy parameters from option_defs_us array
+    for (i = 0; i < num_options; i++)
+    {
+        const char *key  = option_defs_us[i].key;
+        const char *hint = option_defs_us[i].info;
+        if (hint)
+        {
+            // Quick and dirty, its the only consistent naming
+            // Otherwise GlideN64 Setting keys will need to be broken again..
+            if (!!strstr(hint, "(GLideN64)"))
+            {
+                option_display_gliden64.key = key;
+                environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display_gliden64);
+            } else if (!!strstr(hint, "(Angrylion)"))
+            {
+                option_display_angrylion.key = key;
+                environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display_angrylion);
+            } else if (!!strstr(key, "(ParaLLEl-RDP)")) // Maybe unify it later?
+            {
+                option_display_parallel.key = key;
+                environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display_glide64);
+            } else if (!!strstr(key, "(Glide64)")) // Maybe unify it later?
+            {
+                option_display_glide64.key = key;
+                environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display_parallel);
+            }
+        }
+    }
+
+    return true;
+}
+
+static void setup_variables(void)
+{
+   bool categoriesSupported = false;
+   bool updateDisplayCbSupported = false;
+   struct retro_core_options_update_display_callback updateDisplayCb;
+
+   static const struct retro_controller_description port[] = {
+      { "Controller", RETRO_DEVICE_JOYPAD },
+      { "Mouse", RETRO_DEVICE_MOUSE },
+      { "RetroPad", RETRO_DEVICE_JOYPAD },
+      { "Analog", RETRO_DEVICE_ANALOG },
+   };
+
+   static const struct retro_controller_info ports[] = {
+      { port, 4 },
+      { port, 4 },
+      { port, 4 },
+      { port, 4 },
+      { 0, 0 }
+   };
+
+    libretro_set_core_options(environ_cb, &categoriesSupported);
+    if (categoriesSupported)
+        CoreOptionCategoriesSupported = 1;
+
+    updateDisplayCb.callback = set_variable_visibility;
+    updateDisplayCbSupported = environ_cb(
+            RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK,
+            &updateDisplayCb);
+    if (updateDisplayCbSupported)
+        CoreOptionUpdateDisplayCbSupported = 1;
+
+   environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
+   environ_cb(RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO, (void*)subsystems);
+}
+
+bool is_cartridge_rom(const uint8_t* data)
+{
+   uint32_t magic;
+
+   if (data == NULL)
+      return false;
+
+   magic = *((uint32_t *)data);
+
+   /* A recognised D64 region marker (JP, US) is a disk regardless of any
+    * option. */
+   if (magic == 0x16D348E8 || magic == 0x56EE6322)
+      return false;
+
+   /* A recognised cartridge header (z64, v64 and n64 byte orders) is a
+    * cartridge regardless of any option: the 64DD Hardware option must never
+    * reroute positively identified content, or enabling it would send every
+    * cartridge game to the disk drive. */
+   if (magic == 0x40123780 || magic == 0x12408037 || magic == 0x80371240)
+      return true;
+
+   /* Neither marker matched. With the 64DD Hardware option on, unidentified
+    * content is a disk: a development disk carries DD_REGION_DV, four zero
+    * bytes, and a MAME or SDK dump is identified by its size rather than by
+    * anything at offset zero. When a disk is already mounted through the
+    * cartridge+disk subsystem, the slot being classified here is the
+    * cartridge by construction, so the cartridge default stands there. */
+   if (dd_hardware && disk_data == NULL)
+      return false;
+
+   return true;
+}
+
+
+/* Every 64DD disk used to be staged to one fixed filename, and the core
+ * derives the disk-save name from the staged name by appending
+ * ".disk_save".  It also prefers that save over the disk file itself, so
+ * once any 64DD title had been played its save stood in for whatever
+ * disk was loaded next: asking for Mario Artist Talent Studio got you
+ * the last disk you had played.  Give each disk its own staged name so
+ * its save is its own too. */
+static void dd_staged_name(char* out, size_t out_len, const char* dir,
+      char slash, const uint8_t* image, size_t image_size)
+{
+   /* FNV-1a over the head of the image plus its length: the system area
+    * that leads a disk differs between titles, and the length separates
+    * the dump formats. */
+   uint64_t h = 1469598103934665603ULL;
+   size_t   n = (image_size < 0x10000u) ? image_size : 0x10000u;
+   size_t   i;
+
+   for (i = 0; i < n; ++i)
+   {
+      h ^= image[i];
+      h *= 1099511628211ULL;
+   }
+   h ^= (uint64_t)image_size;
+   h *= 1099511628211ULL;
+
+   snprintf(out, out_len, "%s%cparallel_n64_dd_%016llx.ndd",
+            dir, slash, (unsigned long long)h);
+}
+
+static bool emu_step_load_data()
+{
+   const char *dir;
+   bool loaded = false;
+   char slash;
+
+   #if defined(_WIN32)
+      slash = '\\';
+   #else
+      slash = '/';
+   #endif
+
+   if(CoreStartup(FRONTEND_API_VERSION, ".", ".", "Core", n64DebugCallback, 0, 0) && log_cb)
+       log_cb(RETRO_LOG_ERROR, "mupen64plus: Failed to initialize core\n");
+
+   if (cart_data != NULL && cart_size != 0)
+   {
+      /* N64 Cartridge loading */
+      loaded = true;
+
+      if (log_cb)
+         log_cb(RETRO_LOG_INFO, "EmuThread: M64CMD_ROM_OPEN\n");
+
+      if(CoreDoCommand(M64CMD_ROM_OPEN, cart_size, (void*)cart_data))
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "mupen64plus: Failed to load ROM\n");
+         goto load_fail;
+      }
+
+#if defined(HAVE_PARALLEL)
+      /* The per-game override is only known once the ROM header has been
+       * parsed, which happens after the initial update_variables(). */
+      if (g_force_parallel_sync)
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_INFO, "mupen64plus: forcing synchronous RDP for this game.\n");
+         parallel_set_synchronous_rdp(true);
+      }
+#endif
+
+      free(cart_data);
+      cart_data = NULL;
+
+      if (log_cb)
+         log_cb(RETRO_LOG_INFO, "EmuThread: M64CMD_ROM_GET_HEADER\n");
+
+      if(CoreDoCommand(M64CMD_ROM_GET_HEADER, sizeof(ROM_HEADER), &ROM_HEADER))
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "mupen64plus; Failed to query ROM header information\n");
+         goto load_fail;
+      }
+
+   }
+   if (disk_data != NULL && disk_size != 0)
+   {
+      /* 64DD Disk loading */
+
+      loaded = true;
+      if (!environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) || !dir)
+         goto load_fail;
+
+      /* connect saved_memory.disk to disk */
+      g_dd_disk = saved_memory.disk;
+
+      /* The current core reads the DD disk and IPL by *filename*
+       * (open_disk() for MD5/settings and load_dd_disk() for the drive both
+       * fall back to retro_dd_path_img; load_dd_rom() reads the IPL from the
+       * system dir).  The old buffer-based M64CMD_DISK_OPEN/M64CMD_DDROM_OPEN
+       * commands this block used to call are a stale API the core no longer
+       * implements, so DISK_OPEN(buffer) was rejected and 64DD never loaded.
+       * Stage the disk image to a file and point the loader at it. */
+      {
+         char disk_tmp_path[512];
+         RFILE* df;
+
+         dd_staged_name(disk_tmp_path, sizeof(disk_tmp_path), dir, slash,
+                        disk_data, disk_size);
+         df = filestream_open(disk_tmp_path, RETRO_VFS_FILE_ACCESS_WRITE, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+         if (df == NULL)
+         {
+            if (log_cb)
+               log_cb(RETRO_LOG_ERROR, "mupen64plus: couldn't stage DD disk image\n");
+            goto load_fail;
+         }
+         if (filestream_write(df, disk_data, disk_size) != (int64_t)disk_size)
+         {
+            if (log_cb)
+               log_cb(RETRO_LOG_ERROR, "mupen64plus: short write staging DD disk image\n");
+            filestream_close(df);
+            goto load_fail;
+         }
+         filestream_close(df);
+
+         if (retro_dd_path_img)
+            free(retro_dd_path_img);
+         retro_dd_path_img = strdup(disk_tmp_path);
+
+         /* IPL: load_dd_rom() prefers retro_dd_path_rom when set */
+         if (retro_dd_path_rom)
+            free(retro_dd_path_rom);
+         {
+            char ipl_path[512];
+            snprintf(ipl_path, sizeof(ipl_path), "%s%c64DD_IPL.bin", dir, slash);
+            retro_dd_path_rom = strdup(ipl_path);
+         }
+      }
+
+      free(disk_data);
+      disk_data = NULL;
+
+      if (log_cb)
+         log_cb(RETRO_LOG_INFO, "EmuThread: M64CMD_DISK_OPEN\n");
+
+      if(CoreDoCommand(M64CMD_DISK_OPEN, 0, NULL))
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "mupen64plus: Failed to load DISK\n");
+         goto load_fail;
+      }
+
+      if (log_cb)
+         log_cb(RETRO_LOG_INFO, "EmuThread: M64CMD_ROM_GET_HEADER\n");
+
+      if(CoreDoCommand(M64CMD_ROM_GET_HEADER, sizeof(ROM_HEADER), &ROM_HEADER))
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "mupen64plus; Failed to query ROM header information\n");
+         goto load_fail;
+      }
+   }
+   return loaded;
+
+load_fail:
+   free(cart_data);
+   cart_data = NULL;
+   free(disk_data);
+   disk_data = NULL;
+   mupencorestop = 1;
+
+   return false;
+}
+
+#ifdef HAVE_THR_AL
+extern struct rgba prescale[PRESCALE_WIDTH * PRESCALE_HEIGHT];
+#endif
+
+/* The size of the angrylion frame last declared to the frontend. */
+static unsigned al_declared_w, al_declared_h;
+
+/* RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER for angrylion: a
+ * buffer of the frontend's own that the VI can render the frame into, so
+ * that video_cb hands back the frontend's pointer and nothing is copied.
+ * Returns NULL - and the VI renders into its own buffer as before - when
+ * the frontend has no such buffer, when this is a hidden run-ahead frame,
+ * when the size is one the frontend has not been told about yet, or when
+ * the caller has to read its own output back (need_read) and the memory
+ * is not cached. pitch is in pixels. */
+void *angrylion_acquire_sw_framebuffer(unsigned width, unsigned height,
+      unsigned *pitch, bool need_read)
+{
+   struct retro_framebuffer fb;
+
+   if (frame_hidden || !width || !height
+         || width != al_declared_w || height != al_declared_h)
+      return NULL;
+
+   memset(&fb, 0, sizeof(fb));
+   fb.width        = width;
+   fb.height       = height;
+   fb.access_flags = RETRO_MEMORY_ACCESS_WRITE
+                   | (need_read ? RETRO_MEMORY_ACCESS_READ : 0);
+
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
+         || !fb.data
+         || fb.format != RETRO_PIXEL_FORMAT_XRGB8888
+         || (fb.pitch % 4) != 0 || fb.pitch < width * 4)
+      return NULL;
+   if (need_read && !(fb.memory_flags & RETRO_MEMORY_TYPE_CACHED))
+      return NULL;
+
+   *pitch = (unsigned)(fb.pitch / 4);
+   return fb.data;
+}
+
+static void present_frame(void)
+{
+   switch (gfx_plugin)
+   {
+         case GFX_ANGRYLION:
+#ifdef HAVE_THR_AL
+            {
+               if (screen_width != al_declared_w || screen_height != al_declared_h)
+               {
+                  /* the size of the presented frame changed: declare it,
+                   * as the upscaled output is larger than the console's */
+                  al_declared_w = screen_width; al_declared_h = screen_height;
+                  reinit_screen = true;
+               }
+            }
+            video_cb(screen_pixels ? screen_pixels : prescale, screen_width, screen_height, screen_pitch);
+#endif
+            break;
+
+         case GFX_PARALLEL:
+#if defined(HAVE_PARALLEL)
+            parallel_profile_video_refresh_begin();
+            video_cb(parallel_frame_is_valid() ? RETRO_HW_FRAME_BUFFER_VALID : NULL,
+                    parallel_frame_width(), parallel_frame_height(), 0);
+            parallel_profile_video_refresh_end();
+#endif
+            break;
+
+         default:
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+            /* the E90 sprite chip draws mtetrisc's playfield; the hardware
+             * renderers leave the frame on the GPU, so it is composited there */
+            aleck64_e90_gl_draw(screen_width, screen_height);
+            video_cb(RETRO_HW_FRAME_BUFFER_VALID, screen_width, screen_height, 0);
+#elif defined(HAVE_THR_AL)
+            video_cb((screen_pitch == 0) ? NULL : (screen_pixels ? screen_pixels : prescale), screen_width, screen_height, screen_pitch);
+#else
+            video_cb(NULL, screen_width, screen_height, screen_pitch);
+#endif
+            break;
+   }
+}
+
+/* End of the frame slice, and the only place a video frame leaves the
+ * core: exactly one video_cb per retro_run. Every renderer latches its
+ * finished frame through retro_return(true); this presents it, or
+ * presents the previous frame again (video_cb with NULL data) when the
+ * game did not finish one during this VI - a 30 fps title on its off
+ * VI, a frozen RDP, a blanked VI - so the frontend's pacing, fast-
+ * forward, run-ahead and netplay always get their pulse. */
+void emu_step_render(void)
+{
+   /* Hidden run-ahead / rewind frame: the frontend has video disabled and
+    * will throw this frame away, so issue no video_cb at all.  Presenting
+    * here -- above all a RETRO_HW_FRAME_BUFFER_VALID parallel-RDP frame --
+    * while the frontend's video path is torn down for run-ahead is what
+    * crashed single-instance run-ahead.  Skipping the duplicate too keeps
+    * us from feeding the frontend a stale buffer on the hidden frame. */
+   if (frame_hidden)
+   {
+      frame_latched = false;
+      return;
+   }
+
+   if (frame_latched)
+   {
+      frame_latched = false;
+      present_frame();
+   }
+   else
+      video_cb(NULL, screen_width, screen_height, screen_pitch);
+}
+
+#ifdef HAVE_PARALLEL
+static bool parallel_initialized = false;
+
+/* Brings parallel-RDP up once per Vulkan context. It has to be running
+ * before the guest executes a single instruction: an RDP list submitted
+ * while it is down is dropped, and a program that draws once at boot
+ * (krom's RDP tests, homebrew) would then show nothing but black. */
+static void init_parallel_plugin(void)
+{
+   if (parallel_initialized)
+      return;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &vulkan) || !vulkan)
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR, "Failed to obtain Vulkan interface.\n");
+   }
+   else if (!parallel_init(vulkan))
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR, "parallel-RDP init failed (device unsupported); nothing will be rendered.\n");
+   }
+   else
+      parallel_initialized = true;
+}
+#endif
+
+static void emu_step_initialize(void)
+{
+   if (emu_initialized)
+      return;
+
+   emu_initialized = true;
+
+   core_settings_set_defaults();
+   core_settings_autoselect_gfx_plugin();
+   core_settings_autoselect_rsp_plugin();
+
+   /* Bridge fork gfx_plugin/rsp_plugin enums -> next current_rdp_type/
+    * current_rsp_type, which next's plugin_connect_all() dispatches on. */
+   switch (gfx_plugin)
+   {
+      case GFX_ANGRYLION: current_rdp_type = RDP_PLUGIN_ANGRYLION; break;
+      case GFX_PARALLEL:  current_rdp_type = RDP_PLUGIN_PARALLEL;  break;
+      case GFX_GLIDEN64:  current_rdp_type = RDP_PLUGIN_GLIDEN64;  break;
+      case GFX_RICE:      current_rdp_type = RDP_PLUGIN_RICE;      break;
+      case GFX_GLN64:     current_rdp_type = RDP_PLUGIN_GLN64;     break;
+      case GFX_GLIDE64:   current_rdp_type = RDP_PLUGIN_GLIDE64;   break;
+      default:            current_rdp_type = RDP_PLUGIN_GLIDEN64;  break;
+   }
+   switch (rsp_plugin)
+   {
+      case RSP_HLE:      current_rsp_type = RSP_PLUGIN_HLE;      break;
+      case RSP_CXD4:     current_rsp_type = RSP_PLUGIN_CXD4;     break;
+      case RSP_PARALLEL: current_rsp_type = RSP_PLUGIN_PARALLEL; break;
+      default:           current_rsp_type = RSP_PLUGIN_HLE;      break;
+   }
+   plugin_connect_all();
+
+#ifdef HAVE_PARALLEL
+   /* plugin_connect_all handed the plugin its RDRAM and register
+    * pointers; start parallel-RDP before EXECUTE runs the first frame. */
+   if (gfx_plugin == GFX_PARALLEL)
+      init_parallel_plugin();
+#endif
+
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, "EmuThread: M64CMD_EXECUTE.\n");
+
+   CoreDoCommand(M64CMD_EXECUTE, 0, NULL);
+}
+
+extern void gliden64RomOpen();
+extern void gliden64RomClosed();
+static void EmuThreadInit(void);
+void reinit_gfx_plugin(void)
+{
+    if(first_context_reset)
+    {
+        first_context_reset = false;
+        /* Runs emu_step_initialize before the plugin RomOpen calls below:
+         * GLideN64's RomOpen dereferences core state (RSP, memory) that
+         * only exists after initialization. */
+        EmuThreadInit();
+    }
+
+    switch (gfx_plugin)
+    {
+       case GFX_GLIDE64:
+#ifdef HAVE_GLIDE64
+          glide64InitGfx();
+#endif
+          break;
+       case GFX_GLN64:
+#ifdef HAVE_GLN64
+          gles2n64_reset();
+#endif
+          break;
+       case GFX_GLIDEN64:
+#ifdef HAVE_GLIDEN64
+          gliden64RomClosed();
+          gliden64RomOpen();
+#endif
+          break;
+       case GFX_RICE:
+#ifdef HAVE_RICE
+          {
+             /* rice's RomClosed dereferences singletons (CGraphicsContext::Get()
+              * etc.) that are NULL until the first RomOpen, so -- unlike the
+              * gliden64 branch -- it must not run on the initial connect. Only
+              * tear down once rice has actually been opened. */
+             static bool rice_opened = false;
+             if (rice_opened)
+                riceRomClosed();
+             riceRomOpen();
+             rice_opened = true;
+          }
+#endif
+          break;
+       case GFX_ANGRYLION:
+          /* Stub */
+          break;
+       case GFX_PARALLEL:
+#ifdef HAVE_PARALLEL
+          init_parallel_plugin();
+#endif
+          break;
+    }
+}
+
+void deinit_gfx_plugin(void)
+{
+    switch (gfx_plugin)
+    {
+       case GFX_PARALLEL:
+#if defined(HAVE_PARALLEL)
+          parallel_deinit();
+          parallel_initialized = false;
+#endif
+          break;
+       case GFX_ANGRYLION:
+          break;
+       default:
+          /* All GL renderers (gln64 / gliden64 / glide64 / rice) bring up the
+           * glsm context via the default case in context_reset(); tear it down
+           * symmetrically here.  parallel (Vulkan) and angrylion (software)
+           * never touch glsm, so they must not fall into this path -- doing so
+           * drove GLSM_CTL_STATE_CONTEXT_DESTROY on a context glsm never set up,
+           * which hung content-close on the parallel back-end. */
+          glsm_ctl(GLSM_CTL_STATE_CONTEXT_DESTROY, NULL);
+          break;
+    }
+}
+
+static void EmuThreadInit(void)
+{
+    /* May be reached twice: from the first context_reset (GL plugins) and
+     * from the first retro_run (angrylion/parallel have no context reset).
+     * Only the first call may initialize. */
+    if (!initializing)
+        return;
+
+    emu_step_initialize();
+
+    initializing = false;
+
+    main_pre_run();
+}
+
+static void EmuThreadStep(void)
+{
+    /* Once the core has genuinely stopped (CoreDoCommand STOP, fatal
+     * condition in the emulated CPU, ...), r4300_execute has already torn
+     * the dynarec down -- never re-enter it.  This mirrors the libco
+     * behaviour of switching into a dead emulator thread. */
+    if (g_real_stop)
+        return;
+
+    stop_stepping = false;
+    frame_break = 0;
+    main_run();
+}
+
+const char* retro_get_system_directory(void)
+{
+    const char* dir;
+    environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir);
+
+    return dir ? dir : ".";
+}
+
+
+void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
+void retro_set_audio_sample(retro_audio_sample_t cb)   { }
+void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_batch_cb = cb; }
+void retro_set_input_poll(retro_input_poll_t cb) { poll_cb = cb; }
+void retro_set_input_state(retro_input_state_t cb) { input_cb = cb; }
+
+
+void retro_set_environment(retro_environment_t cb)
+{
+   environ_cb = cb;
+
+   setup_variables();
+}
+
+void retro_get_system_info(struct retro_system_info *info)
+{
+   info->library_name = "ParaLLEl N64";
+   info->library_version = "1.0" GIT_VERSION;
+   info->valid_extensions = "n64|v64|z64|bin|u1|ndd|zip";
+   /* fullpath + block_extract: the frontend hands us the file untouched, so
+    * zips (MAME Aleck64 sets or zipped roms) are parsed by the core itself;
+    * retro_load_game reads the file when the frontend passes no data */
+   info->need_fullpath = true;
+   info->block_extract = true;
+}
+
+/* Get the system type associated to a ROM country code. */
+static m64p_system_type rom_country_code_to_system_type(char country_code)
+{
+    switch (country_code)
+    {
+        /* PAL codes */
+        case 0x44:
+        case 0x46:
+        case 0x49:
+        case 0x50:
+        case 0x53:
+        case 0x55:
+        case 0x58:
+        case 0x59:
+            return SYSTEM_PAL;
+
+        /* NTSC codes */
+        case 0x37:
+        case 0x41:
+        case 0x45:
+        case 0x4a:
+        default: /* Fallback for unknown codes */
+            return SYSTEM_NTSC;
+    }
+}
+
+/* The largest frame size declared to the frontend so far. */
+static unsigned declared_max_width;
+static unsigned declared_max_height;
+
+void retro_get_system_av_info(struct retro_system_av_info *info)
+{
+   m64p_system_type region = rom_country_code_to_system_type(ROM_HEADER.Country_code);
+
+   info->geometry.base_width   = screen_width;
+   info->geometry.base_height  = screen_height;
+   /* The maximum only ever grows: a frame may not exceed it, and the
+    * frontend sizes its buffers from it. */
+   if (screen_width > declared_max_width)
+      declared_max_width       = screen_width;
+   if (screen_height > declared_max_height)
+      declared_max_height      = screen_height;
+   info->geometry.max_width    = declared_max_width;
+   info->geometry.max_height   = declared_max_height;
+   info->geometry.aspect_ratio = screen_aspect_ratio;
+   /* Report the rate the VI is actually emulated at, not a constant.
+    *
+    * This was 60.13 for every NTSC title, with a "TODO: Actual timing" on
+    * it.  Nothing in the core runs at that rate: the frame period is
+    * vi->delay VI-clock counts, and for a standard NTSC V_SYNC of 0x20D
+    * that is 48681812 / 811125 = 60.0176 Hz.  Declaring 60.13 overstates it
+    * by 0.19%, which the frontend has to absorb somewhere - as a resampling
+    * ratio it holds against the real production rate, or as frame pacing
+    * that never quite lands.  PAL comes out at 50.0003 Hz against a
+    * declared 50.
+    *
+    * Before the game programs V_SYNC there is no period to read, so fall
+    * back to the rate a standard V_SYNC would give for the region rather
+    * than to the nominal integer - that is what the title will almost
+    * always settle on, and it keeps the value the frontend sees at load
+    * consistent with the one it sees a frame later. */
+   {
+      double fps = vi_actual_refresh_rate(&g_dev.vi);
+
+      if (fps <= 0.0)
+      {
+         const unsigned int clock = vi_clock_from_tv_standard(region);
+         const unsigned int rr    = vi_expected_refresh_rate_from_tv_standard(region);
+         const unsigned int vsync = (region == SYSTEM_PAL) ? 625u : 525u;
+         const unsigned int delay = vsync * ((clock / rr) / vsync);
+
+         fps = (delay != 0) ? (double)clock / (double)delay : (double)rr;
+      }
+
+      info->timing.fps = fps;
+   }
+   info->timing.sample_rate = get_audio_sample_rate_libretro();
+}
+
+unsigned retro_get_region (void)
+{
+   m64p_system_type region = rom_country_code_to_system_type(ROM_HEADER.Country_code);
+   return ((region == SYSTEM_PAL) ? RETRO_REGION_PAL : RETRO_REGION_NTSC);
+}
+
+#if defined(HAVE_PARALLEL) || defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#ifdef HAVE_GLIDEN64
+/* gliden64's BufferedDrawer / ColorBufferReaderWithBufferStorage use
+ * GL_MAP_PERSISTENT_BIT mappings that become invalid when the GL context
+ * is destroyed and recreated (e.g. RetroArch fullscreen toggle). RetroArch
+ * does not call context_destroy() before recreating the context, so we
+ * detect the second-and-subsequent context_reset() by checking
+ * 'first_context_reset' and tear down + re-init the gliden64 graphics state
+ * around it. Forward-declared here rather than via a header to keep the
+ * dependency in one place; the C linkage matches the gliden64 EXPORT.
+ */
+extern void gliden64DestroyGfxContext(void);
+extern void gliden64ReinitGfxContext(void);
+#endif
+
+static void context_reset(void)
+{
+   switch (gfx_plugin)
+   {
+      case GFX_ANGRYLION:
+      case GFX_PARALLEL:
+         break;
+      default:
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+         {
+            printf("context_reset.\n");
+            glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
+
+            if (!context_setup_first_init)
+            {
+               glsm_ctl(GLSM_CTL_STATE_SETUP, NULL);
+               context_setup_first_init = true;
+            }
+         }
+#ifdef HAVE_GLIDEN64
+         /* Only from the second context_reset on: on the first there is
+          * nothing to tear down.  'first_context_reset' says that directly,
+          * where 'emu_initialized' only says the machine has been set up --
+          * which is not the same thing the moment anything initialises it
+          * before a context exists. */
+         if (gfx_plugin == GFX_GLIDEN64 && !first_context_reset)
+         {
+            gliden64DestroyGfxContext();
+            gliden64ReinitGfxContext();
+         }
+#endif
+#endif
+         break;
+   }
+
+   aleck64_e90_gl_context_reset();
+   reinit_gfx_plugin();
+}
+
+static void context_destroy(void)
+{
+   aleck64_e90_gl_destroy();
+   deinit_gfx_plugin();
+}
+#endif
+
+static bool retro_init_vulkan(void)
+{
+#if defined(HAVE_PARALLEL)
+   hw_render.context_type    = RETRO_HW_CONTEXT_VULKAN;
+   hw_render.version_major   = VK_MAKE_VERSION(1, 0, 12);
+   hw_render.context_reset   = context_reset;
+   hw_render.context_destroy = context_destroy;
+
+   if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR, "mupen64plus: libretro frontend doesn't have Vulkan support.\n");
+      return false;
+   }
+
+   hw_context_negotiation.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+   hw_context_negotiation.interface_version = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION;
+   hw_context_negotiation.get_application_info = parallel_get_application_info;
+   hw_context_negotiation.create_device = parallel_create_device;
+   hw_context_negotiation.destroy_device = NULL;
+   if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, &hw_context_negotiation))
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR, "mupen64plus: libretro frontend doesn't have context negotiation support.\n");
+   }
+
+   return true;
+#else
+   return false;
+#endif
+}
+
+static bool context_framebuffer_lock(void *data)
+{
+   if (!mupencorestop)
+      return false;
+   return true;
+}
+
+static bool retro_init_gl(bool core)
+{
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+   glsm_ctx_params_t params     = {0};
+
+   params.context_reset         = context_reset;
+   params.context_destroy       = context_destroy;
+   params.environ_cb            = environ_cb;
+   params.stencil               = false;
+   // Requesting core for Windows breaks fullscreen
+#if !defined(HAVE_OPENGLES) && !defined(OS_WINDOWS)
+   if (core)
+   {
+      params.core               = core;
+      if (EnableFBEmulation)
+      {
+         params.major = 4;
+         params.minor = 3;
+      }
+      else
+      {
+         params.major = 3;
+         params.minor = 3;
+      }
+   }
+#endif
+
+   params.framebuffer_lock      = context_framebuffer_lock;
+
+   if (!glsm_ctl(GLSM_CTL_STATE_CONTEXT_INIT, &params))
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR, "mupen64plus: libretro frontend doesn't have OpenGL support.\n");
+      return false;
+   }
+
+   return true;
+#else
+   return false;
+#endif
+}
+
+
+
+/* mupen64plus config subsystem (mupen64plus-core/src/api/config.c). The rice
+ * video plugin reads its settings -- including the output resolution -- through
+ * ConfigOpenSection()/ConfigGetParam*(), all of which return M64ERR_NOT_INIT
+ * until ConfigInit() flips the subsystem on. */
+extern m64p_error ConfigInit(const char *ConfigDirOverride, const char *DataDirOverride);
+
+void retro_init(void)
+{
+   struct retro_log_callback log;
+   unsigned colorMode = RETRO_PIXEL_FORMAT_XRGB8888;
+   uint64_t serialization_quirks = RETRO_SERIALIZATION_QUIRK_MUST_INITIALIZE;
+
+   /* Bring up the config subsystem before any plugin tries to open its config
+    * section.  Without this, rice's LoadConfiguration() bails early (sections
+    * never open), windowSetting.uDisplayWidth/Height stay 0, and the renderer
+    * draws into a 0x0 viewport -- a black screen with working audio. */
+   ConfigInit(NULL, NULL);
+
+   screen_pitch = 0;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log))
+      log_cb = log.log;
+   else
+      log_cb = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_PERF_INTERFACE, &perf_cb))
+      perf_get_cpu_features_cb = perf_cb.get_cpu_features;
+   else
+      perf_get_cpu_features_cb = NULL;
+
+   environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &colorMode);
+   environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble);
+
+   environ_cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &serialization_quirks);
+   initializing = true;
+
+   /* hacky stuff for Glide64 */
+   polygonOffsetUnits = -3.0f;
+   polygonOffsetFactor =  -3.0f;
+
+}
+
+void retro_deinit(void)
+{
+   mupen_main_stop();
+   mupen_main_exit();
+   CoreShutdown();
+
+   deinit_audio_libretro();
+
+   if (perf_cb.perf_log)
+      perf_cb.perf_log();
+
+   vulkan_inited     = false;
+   gl_inited         = false;
+
+   CoreOptionCategoriesSupported = 0;
+   CoreOptionUpdateDisplayCbSupported = 0;
+}
+
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+extern void glide_set_filtering(unsigned value);
+#endif
+extern void angrylion_set_vi(unsigned value);
+extern void angrylion_set_filtering(unsigned value);
+extern void angrylion_set_dithering(unsigned value);
+extern void  angrylion_set_threads(unsigned value);
+extern void  angrylion_set_synchronous(unsigned value);
+extern void  angrylion_set_overscan(unsigned value);
+extern void  angrylion_set_vi_dedither(unsigned value);
+extern void  angrylion_set_vi_blur(unsigned value);
+extern void  angrylion_set_deinterlace(unsigned value);
+
+extern void angrylion_set_synclevel(unsigned value);
+extern void angrylion_set_upscaling(unsigned value);
+extern void angrylion_set_native_texture_lod(unsigned value);
+extern void ChangeSize();
+
+static void gfx_set_filtering(void)
+{
+     if (log_cb)
+        log_cb(RETRO_LOG_DEBUG, "set filtering mode...\n");
+     switch (gfx_plugin)
+     {
+        case GFX_GLIDE64:
+#ifdef HAVE_GLIDE64
+           glide_set_filtering(retro_filtering);
+#endif
+           break;
+        case GFX_ANGRYLION:
+#ifdef HAVE_THR_AL
+           angrylion_set_filtering(retro_filtering);
+#endif
+           break;
+        case GFX_RICE:
+#ifdef HAVE_RICE
+           /* TODO/FIXME */
+#endif
+           break;
+        case GFX_PARALLEL:
+#ifdef HAVE_PARALLEL
+           /* Stub */
+#endif
+           break;
+        case GFX_GLN64:
+#ifdef HAVE_GLN64
+           /* Stub */
+#endif
+        case GFX_GLIDEN64:
+#ifdef HAVE_GLIDEN64
+           /* Stub */
+#endif
+           break;
+     }
+}
+
+unsigned setting_get_dithering(void)
+{
+   return retro_dithering;
+}
+
+static void gfx_set_dithering(void)
+{
+   if (log_cb)
+      log_cb(RETRO_LOG_DEBUG, "set dithering mode...\n");
+
+   switch (gfx_plugin)
+   {
+      case GFX_GLIDE64:
+#ifdef HAVE_GLIDE64
+         /* Stub */
+#endif
+         break;
+      case GFX_ANGRYLION:
+#ifdef HAVE_THR_AL
+         angrylion_set_vi_dedither(!retro_dithering);
+         angrylion_set_dithering(retro_dithering);
+#endif
+         break;
+      case GFX_RICE:
+#ifdef HAVE_RICE
+         /* Stub */
+#endif
+         break;
+      case GFX_PARALLEL:
+         break;
+      case GFX_GLN64:
+#ifdef HAVE_GLN64
+         /* Stub */
+#endif
+      case GFX_GLIDEN64:
+#ifdef HAVE_GLIDEN64
+         /* Stub */
+#endif
+         break;
+     }
+}
+
+/* Maps a mouse-button option value to the button codes consumed by
+ * apply_mouse_button() in emulate_game_controller_via_libretro.c */
+static int parse_mouse_button(const char* value)
+{
+   static const char* const names[] = {
+      "Z", "A", "B", "L", "R", "Start",
+      "C-Up", "C-Down", "C-Left", "C-Right"
+   };
+   int i;
+   for (i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++)
+   {
+      if (!strcmp(value, names[i]))
+         return i + 1;
+   }
+   return 0; /* "None" or unrecognized */
+}
+
+void update_variables(bool startup)
+{
+   struct retro_variable var;
+
+   /* CPU core selection: pure interpreter (0), cached interpreter (1),
+    * or dynamic recompiler (2+). next reads r4300_emumode at init_device;
+    * the fork exposes it via the parallel-n64-cpucore core option. When both
+    * dynarecs are compiled in, the dropdown also distinguishes the JIT backend
+    * (dynamic_recompiler -> Hacktarux, dynamic_recompiler_ari64 -> ari64), which
+    * sets r4300_jit_backend. */
+   if (startup)
+   {
+      struct retro_variable cpuvar;
+      cpuvar.key = "parallel-n64-cpucore";
+      cpuvar.value = NULL;
+#if !defined(NEW_DYNAREC) && defined(HAVE_DYNAREC_HACKTARUX)
+      r4300_jit_backend = 1; /* R4300_JIT_HACKTARUX: ari64 is not compiled in */
+#else
+      r4300_jit_backend = 0; /* default: ari64 */
+#endif
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &cpuvar) && cpuvar.value)
+      {
+         if (!strcmp(cpuvar.value, "pure_interpreter"))   r4300_emumode = 0;
+         else if (!strcmp(cpuvar.value, "cached_interpreter")) r4300_emumode = 1;
+         else
+         {
+            r4300_emumode = 2; /* dynarec */
+#if defined(HAVE_DYNAREC_HACKTARUX) && defined(NEW_DYNAREC)
+            /* With both backends built, "dynamic_recompiler" selects Hacktarux
+             * and "dynamic_recompiler_ari64" selects ari64. */
+            if (!strcmp(cpuvar.value, "dynamic_recompiler_ari64"))
+               r4300_jit_backend = 0; /* R4300_JIT_ARI64 */
+            else
+               r4300_jit_backend = 1; /* R4300_JIT_HACKTARUX */
+#endif
+         }
+      }
+      else
+         r4300_emumode = 2; /* default: dynamic recompiler */
+   }
+   /* NOTE: the CPU core / JIT backend is applied at startup only. Changing it in
+    * the Quick Menu while content is running must NOT switch dynarecs on the fly
+    * -- the live backend's recompiled blocks and register state are not valid for
+    * the other backend, so a mid-run flip would crash. The new selection takes
+    * effect on the next core restart, matching upstream behaviour. */
+
+  if (startup)
+  {
+	  struct retro_variable expvar;
+	  struct retro_variable ddvar;
+
+	  /* Expansion Pak. main.c derives rdram_size from ForceDisableExtraMem, but
+	   * nothing ever assigned it, so the option was inert and every game got the
+	   * full 8MB whatever the user picked -- titles that require the Pak booted
+	   * with it "off", and titles meant to be tested without it could not be.
+	   * Startup only, since rdram_size is fixed when the device is built. */
+	  expvar.key = "parallel-n64-disable_expmem";
+	  expvar.value = NULL;
+	  ForceDisableExtraMem = 0;
+	  if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &expvar) && expvar.value)
+		  ForceDisableExtraMem = !strcmp(expvar.value, "disabled") ? 1 : 0;
+
+	  /* 64DD Hardware. Decides how content that carries neither a cartridge
+	   * header nor a D64 region marker is classified: with the option on, such
+	   * content goes to the disk drive. Positively identified content is
+	   * routed by its header either way. Startup only, before retro_load_game
+	   * classifies anything. */
+	  ddvar.key = "parallel-n64-64dd-hardware";
+	  ddvar.value = NULL;
+	  dd_hardware = false;
+	  if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &ddvar) && ddvar.value)
+		  dd_hardware = !strcmp(ddvar.value, "enabled");
+
+	  /* Startup only: the value is consumed when the ari64 dynarec builds
+	   * its memory map, and a mid-game toggle would leave stale mappings. */
+	  ddvar.key = "parallel-n64-goldeneye-tlb-hack";
+	  ddvar.value = NULL;
+	  goldeneye_tlb_hack = 1;
+	  if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &ddvar) && ddvar.value)
+		  goldeneye_tlb_hack = !strcmp(ddvar.value, "enabled");
+  }
+
+#if defined(HAVE_PARALLEL)
+   var.key = "parallel-n64-parallel-rdp-synchronous";
+   var.value = NULL;
+   if (g_force_parallel_sync)
+   {
+      /* This game reads rendered frames back from RDRAM and soft-locks
+       * with asynchronous RDP; ignore the core option. */
+      parallel_set_synchronous_rdp(true);
+   }
+   else if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      parallel_set_synchronous_rdp(!strcmp(var.value, "enabled"));
+   else
+      parallel_set_synchronous_rdp(true);
+
+   var.key = "parallel-n64-parallel-rdp-overscan";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+	   parallel_set_overscan_crop(strtol(var.value, NULL, 0));
+   else
+	   parallel_set_overscan_crop(0);
+   
+   var.key = "parallel-n64-parallel-rdp-divot-filter";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+	   parallel_set_divot_filter(!strcmp(var.value, "enabled"));
+   else
+	   parallel_set_divot_filter(true);
+
+   var.key = "parallel-n64-parallel-rdp-gamma-dither";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+	   parallel_set_gamma_dither(!strcmp(var.value, "enabled"));
+   else
+	   parallel_set_gamma_dither(true);
+
+   var.key = "parallel-n64-parallel-rdp-vi-aa";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+	   parallel_set_vi_aa(!strcmp(var.value, "enabled"));
+   else
+	   parallel_set_vi_aa(true);
+
+   var.key = "parallel-n64-parallel-rdp-vi-bilinear";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+	   parallel_set_vi_scale(!strcmp(var.value, "enabled"));
+   else
+	   parallel_set_vi_scale(true);
+
+   var.key = "parallel-n64-parallel-rdp-dither-filter";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+	   parallel_set_dither_filter(!strcmp(var.value, "enabled"));
+   else
+	   parallel_set_dither_filter(true);
+
+   var.key = "parallel-n64-upscaling";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+       parallel_set_upscaling(strtol(var.value, NULL, 0));
+   else
+       parallel_set_upscaling(1);
+
+   var.key = "parallel-n64-parallel-rdp-downscaling";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+       if (!strcmp(var.value, "disable"))
+           parallel_set_downscaling_steps(0);
+       else if (!strcmp(var.value, "1/2"))
+           parallel_set_downscaling_steps(1);
+       else if (!strcmp(var.value, "1/4"))
+           parallel_set_downscaling_steps(2);
+       else if (!strcmp(var.value, "1/8"))
+           parallel_set_downscaling_steps(3);
+   }
+   else
+       parallel_set_downscaling_steps(0);
+
+   var.key = "parallel-n64-parallel-rdp-native-texture-lod";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+       parallel_set_native_texture_lod(!strcmp(var.value, "enabled"));
+   else
+       parallel_set_native_texture_lod(false);
+
+   var.key = "parallel-n64-parallel-rdp-native-tex-rect";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+       parallel_set_native_tex_rect(!strcmp(var.value, "enabled"));
+   else
+       parallel_set_native_tex_rect(true);
+#endif
+
+   var.key   = "parallel-n64-send_allist_to_hle_rsp";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      /* "enabled"/"disabled" are the values this option had when it was a
+       * boolean; keep accepting them so existing configs keep their meaning. */
+      if (!strcmp(var.value, "hle") || !strcmp(var.value, "enabled"))
+         audio_rsp_mode = AUDIO_RSP_HLE;
+      else if (!strcmp(var.value, "accurate"))
+         audio_rsp_mode = AUDIO_RSP_ACCURATE;
+      else
+         audio_rsp_mode = AUDIO_RSP_FOLLOW;
+   }
+   else
+      audio_rsp_mode = AUDIO_RSP_FOLLOW;
+
+   /* Enhanced HLE voice interpolation.  The quality value is the tap
+    * count; zero turns the enhancement off and restores the microcode's
+    * own four-tap kernel, which is the bit-accurate path. */
+   {
+      int enhanced_taps = 0;
+
+      var.key   = "parallel-n64-enhanced-hle-audio";
+      var.value = NULL;
+
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value
+            && !strcmp(var.value, "enabled"))
+      {
+         enhanced_taps = 32;              /* matches the option default */
+
+         var.key   = "parallel-n64-enhanced-hle-audio-quality";
+         var.value = NULL;
+
+         if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+            enhanced_taps = atoi(var.value);
+      }
+
+      resample_hq_set_quality(enhanced_taps);
+   }
+
+   var.key   = "parallel-n64-screensize";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      /* TODO/FIXME - hack - force screen width and height back to 640x480 in case
+       * we change it with Angrylion. If we ever want to support variable resolution sizes in Angrylion
+       * then we need to drop this. */
+      if (
+#ifdef HAVE_THR_AL
+            gfx_plugin == GFX_ANGRYLION || 
+#endif
+            sscanf(var.value ? var.value : "640x480", "%dx%d", &screen_width, &screen_height) != 2)
+      {
+         screen_width = 640;
+         screen_height = 480;
+      }
+   }
+   else
+   {
+      screen_width  = 640;
+      screen_height = 480;
+   }
+
+   if (startup)
+   {
+      var.key = "parallel-n64-gfxplugin";
+      var.value = NULL;
+
+      environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+
+      if (var.value)
+      {
+#if defined(HAVE_GLN64) || defined(HAVE_GLIDEN64) || defined(HAVE_RICE) || defined(HAVE_GLIDE64) || defined(HAVE_THR_AL) || defined(HAVE_PARALLEL)
+         // TODO: This logic seems wrong?
+         if (!strcmp(var.value, "auto"))
+#ifdef HAVE_GLN64
+         if (!strcmp(var.value, "gln64"))
+            gfx_plugin = GFX_GLN64;
+#endif
+#ifdef HAVE_GLIDEN64
+         if (!strcmp(var.value, "gliden64"))
+            gfx_plugin = GFX_GLIDEN64;
+#endif
+#ifdef HAVE_RICE
+         if (!strcmp(var.value, "rice"))
+            gfx_plugin = GFX_RICE;
+#endif
+#ifdef HAVE_GLIDE64
+         if(!strcmp(var.value, "glide64"))
+            gfx_plugin = GFX_GLIDE64;
+#endif
+#ifdef HAVE_THR_AL
+         if(!strcmp(var.value, "angrylion"))
+            gfx_plugin = GFX_ANGRYLION;
+#endif
+#ifdef HAVE_PARALLEL
+         if(!strcmp(var.value, "parallel"))
+            gfx_plugin = GFX_PARALLEL;
+#endif
+#endif
+      }
+      else
+         core_settings_autoselect_gfx_plugin();
+   }
+
+   
+#ifdef HAVE_THR_AL
+   var.key = "parallel-n64-angrylion-vioverlay";
+   var.value = NULL;
+
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+
+   if (var.value)
+   {
+      if(!strcmp(var.value, "Filtered"))
+      {
+         angrylion_set_vi(0);
+         angrylion_set_vi_dedither(1);
+         angrylion_set_vi_blur(1);
+      }
+      else if(!strcmp(var.value, "AA+Blur"))
+      {
+         angrylion_set_vi(0);
+         angrylion_set_vi_dedither(0);
+         angrylion_set_vi_blur(1);
+      }
+      else if(!strcmp(var.value, "AA+Dedither"))
+      {
+         angrylion_set_vi(0);
+         angrylion_set_vi_dedither(1);
+         angrylion_set_vi_blur(0);
+      }
+      else if(!strcmp(var.value, "AA only"))
+      {
+         angrylion_set_vi(0);
+         angrylion_set_vi_dedither(0);
+         angrylion_set_vi_blur(0);
+      }
+      else if(!strcmp(var.value, "Unfiltered"))
+      {
+         angrylion_set_vi(1);
+         angrylion_set_vi_dedither(1);
+         angrylion_set_vi_blur(1);
+      }
+      else if(!strcmp(var.value, "Depth"))
+      {
+         angrylion_set_vi(2);
+         angrylion_set_vi_dedither(1);
+         angrylion_set_vi_blur(1);
+      }
+      else if(!strcmp(var.value, "Coverage"))
+      {
+         angrylion_set_vi(3);
+         angrylion_set_vi_dedither(1);
+         angrylion_set_vi_blur(1);
+      }
+   }
+   else
+   {
+      angrylion_set_vi(0);
+      angrylion_set_vi_dedither(1);
+      angrylion_set_vi_blur(1);
+   }
+
+   var.key = "parallel-n64-angrylion-deinterlace";
+   var.value = NULL;
+   angrylion_set_deinterlace(
+      environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value
+      && !strcmp(var.value, "bob"));
+
+#ifdef HAVE_THR_AL
+   /* the upscaling factor is shared with ParaLLEl-RDP, which reads it in
+    * its own block above when it is built; angrylion reads it here so
+    * the setting works in builds without it */
+   var.key = "parallel-n64-upscaling";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      angrylion_set_upscaling(strtol(var.value, NULL, 0));
+   else
+      angrylion_set_upscaling(1);
+
+   /* shared with ParaLLEl-RDP in the same way */
+   var.key = "parallel-n64-parallel-rdp-native-texture-lod";
+   var.value = NULL;
+   angrylion_set_native_texture_lod(
+      environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value
+      && !strcmp(var.value, "enabled"));
+#endif
+
+   var.key = "parallel-n64-angrylion-sync";
+   var.value = NULL;
+
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+
+   if (var.value)
+   {
+      if(!strcmp(var.value, "High"))
+         angrylion_set_synclevel(2);
+      else if(!strcmp(var.value, "Medium"))
+         angrylion_set_synclevel(1);
+      else if(!strcmp(var.value, "Low"))
+         angrylion_set_synclevel(0);
+   }
+   else
+      angrylion_set_synclevel(0);
+
+   var.key = "parallel-n64-angrylion-multithread";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if(!strcmp(var.value, "off"))
+         angrylion_set_synchronous(1);
+      else
+      {
+         angrylion_set_synchronous(0);
+         if(!strcmp(var.value, "all threads"))
+            angrylion_set_threads(0);
+         else
+            angrylion_set_threads(atoi(var.value));
+      }
+   }
+   else
+   {
+      angrylion_set_synchronous(0);
+      angrylion_set_threads(0);
+   }
+
+   var.key = "parallel-n64-angrylion-overscan";
+   var.value = NULL;
+
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+
+   if (var.value)
+   {
+      if(!strcmp(var.value, "enabled"))
+         angrylion_set_overscan(1);
+      else if(!strcmp(var.value, "disabled"))
+         angrylion_set_overscan(0);
+   }
+   else
+      angrylion_set_overscan(0);
+#endif
+
+
+   /* Whether to translate the GFX task to HLE rather than running the LLE
+    * microcode is, in general, the user's choice via the RSP plugin option.
+    * Historically the core force-enabled HLE GFX whenever the active video
+    * plugin was not the one paired with the build's native LLE path
+    * (angrylion for the threaded software build, parallel for the Vulkan
+    * build). That silently overrode an explicit "cxd4" selection, making a
+    * requested LLE run secretly execute the HLE emitter. Only apply that
+    * fallback when the RSP plugin is left on "auto"; an explicit choice is
+    * honoured as-is.
+    *
+    * This decision is latched at load (startup): the live RSP plugin is
+    * connected once, in emu_step_initialize(), and is never reconnected on
+    * a mid-run option change. Re-deriving CFG_HLE_GFX from a changed
+    * -rspplugin while the old RSP plugin keeps running desynced the GFX
+    * path from the live RSP and left parallel-rsp spinning at close-content
+    * (its DoRspCycles loop never reaching SP_STATUS_HALT). Honour the RSP
+    * plugin choice on the next content load instead. */
+   if (startup)
+   {
+      CFG_HLE_GFX = 0;
+      {
+         struct retro_variable rsp_var = { CORE_NAME "-rspplugin", 0 };
+         int rsp_is_auto = 1;
+         environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &rsp_var);
+         if (rsp_var.value && strcmp(rsp_var.value, "auto") != 0)
+            rsp_is_auto = 0;
+
+         if (rsp_is_auto)
+         {
+#ifdef HAVE_THR_AL
+            if (gfx_plugin != GFX_ANGRYLION)
+               CFG_HLE_GFX = 1;
+#endif
+
+#ifdef HAVE_PARALLEL
+            if (gfx_plugin != GFX_PARALLEL)
+               CFG_HLE_GFX = 1;
+#endif
+         }
+      }
+   }
+   CFG_HLE_AUD = 0; /* There is no HLE audio code in libretro audio plugin. */
+
+   var.key = "parallel-n64-filtering";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      static signed old_filtering = -1;
+      if (!strcmp(var.value, "automatic"))
+         retro_filtering = 0;
+      else if (!strcmp(var.value, "N64 3-point"))
+#ifdef DISABLE_3POINT
+         retro_filtering = 3;
+#else
+         retro_filtering = 1;
+#endif
+      else if (!strcmp(var.value, "nearest"))
+         retro_filtering = 2;
+      else if (!strcmp(var.value, "bilinear"))
+         retro_filtering = 3;
+
+      if (retro_filtering != old_filtering)
+	gfx_set_filtering();
+
+      old_filtering      = retro_filtering;
+   }
+
+   var.key = "parallel-n64-dithering";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      static signed old_dithering = -1;
+
+      if (!strcmp(var.value, "enabled"))
+         retro_dithering = 1;
+      else if (!strcmp(var.value, "disabled"))
+         retro_dithering = 0;
+
+      gfx_set_dithering();
+
+      old_dithering      = retro_dithering;
+   }
+   else
+   {
+      retro_dithering = 1;
+      gfx_set_dithering();
+   }
+
+   var.key = "parallel-n64-polyoffset-factor";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      float new_val = (float)atoi(var.value);
+      polygonOffsetFactor = new_val;
+   }
+
+   var.key = "parallel-n64-polyoffset-units";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      float new_val = (float)atoi(var.value);
+      polygonOffsetUnits = new_val;
+   }
+
+   var.key = "parallel-n64-astick-deadzone";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      astick_deadzone = ( atoi(var.value) * 0x8000 ) / 100;
+
+   var.key = "parallel-n64-astick-snap-angle-active";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "enabled"))
+         astick_snap_active = 1;
+      else if (!strcmp(var.value, "disabled"))
+         astick_snap_active = 0;
+   }
+
+   var.key = "parallel-n64-astick-snap-max-angle";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      astick_snap_max_angle = (int)(atoi(var.value));
+   }
+
+   var.key = "parallel-n64-astick-snap-min-displacement-percent";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      astick_snap_min_displacement_percent = (int)(atoi(var.value));
+   }
+
+   var.key = "parallel-n64-astick-sensitivity";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      astick_sensitivity = atoi(var.value);
+
+   var.key = "parallel-n64-mouse-mode";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      mouse_mode = !strcmp(var.value, "True");
+
+   var.key = "parallel-n64-mouse-sensitivity-x";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      int val = atoi(var.value);
+      mouse_sensitivity_x = (val < -500) ? -500 : (val > 500) ? 500 : val;
+   }
+
+   var.key = "parallel-n64-mouse-sensitivity-y";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      int val = atoi(var.value);
+      mouse_sensitivity_y = (val < -500) ? -500 : (val > 500) ? 500 : val;
+   }
+
+   var.key = "parallel-n64-mouse-left";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      mouse_left_btn = parse_mouse_button(var.value);
+
+   var.key = "parallel-n64-mouse-right";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      mouse_right_btn = parse_mouse_button(var.value);
+
+   var.key = "parallel-n64-mouse-middle";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      mouse_middle_btn = parse_mouse_button(var.value);
+
+   var.key = "parallel-n64-mouse-wheel-up";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      mouse_wheel_up_btn = parse_mouse_button(var.value);
+
+   var.key = "parallel-n64-mouse-wheel-down";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      mouse_wheel_down_btn = parse_mouse_button(var.value);
+
+   var.key = "parallel-n64-gfxplugin-accuracy";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+       if (var.value && !strcmp(var.value, "veryhigh"))
+          gfx_plugin_accuracy = 3;
+       else if (var.value && !strcmp(var.value, "high"))
+          gfx_plugin_accuracy = 2;
+       else if (var.value && !strcmp(var.value, "medium"))
+          gfx_plugin_accuracy = 1;
+       else if (var.value && !strcmp(var.value, "low"))
+          gfx_plugin_accuracy = 0;
+   }
+
+   var.key = "parallel-n64-virefresh";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "auto")) { }
+      else if (!strcmp(var.value, "1500"))
+         g_count_per_scanline = 1500;
+      else if (!strcmp(var.value, "2200"))
+         g_count_per_scanline = 2200;
+   }
+
+   var.key = "parallel-n64-alt-map";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      bool prev_alternate_mapping = alternate_mapping;
+      if (!strcmp(var.value, "disabled"))
+         alternate_mapping = false;
+      else if (!strcmp(var.value, "enabled"))
+         alternate_mapping = true;
+      /* Re-publish the input descriptors immediately if the user
+       * flipped the option mid-run. inputGetKeys_default_descriptor()
+       * picks the alt-map vs standard layout based on the current
+       * 'alternate_mapping' value and pushes a fresh
+       * RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS array. Skip the
+       * resubmit when nothing changed - including on the startup
+       * pass, where inputPluginStartup() will set the descriptors
+       * shortly anyway via its own call. */
+      if (!startup && alternate_mapping != prev_alternate_mapping)
+         inputGetKeys_default_descriptor();
+   }
+
+
+   {
+      struct retro_variable pk1var = { "parallel-n64-pak1" };
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &pk1var) && pk1var.value)
+      {
+         int p1_pak = PLUGIN_NONE;
+         if (!strcmp(pk1var.value, "rumble"))
+            p1_pak = PLUGIN_RAW;
+         else if (!strcmp(pk1var.value, "memory"))
+            p1_pak = PLUGIN_MEMPAK;
+         else if (!strcmp(pk1var.value, "biosensor"))
+            p1_pak = PLUGIN_BIO_PAK;
+
+         /* If controller struct is not initialised yet, set pad_pak_types instead
+          * which will be looked at when initialising the controllers. */
+         if (controller[0].control)
+            controller[0].control->Plugin = p1_pak;
+         else
+            pad_pak_types[0] = p1_pak;
+
+      }
+   }
+
+   {
+      struct retro_variable pk2var = { "parallel-n64-pak2" };
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &pk2var) && pk2var.value)
+      {
+         int p2_pak = PLUGIN_NONE;
+         if (!strcmp(pk2var.value, "rumble"))
+            p2_pak = PLUGIN_RAW;
+         else if (!strcmp(pk2var.value, "memory"))
+            p2_pak = PLUGIN_MEMPAK;
+         else if (!strcmp(pk2var.value, "biosensor"))
+            p2_pak = PLUGIN_BIO_PAK;
+
+         if (controller[1].control)
+            controller[1].control->Plugin = p2_pak;
+         else
+            pad_pak_types[1] = p2_pak;
+
+      }
+   }
+
+   {
+      struct retro_variable pk3var = { "parallel-n64-pak3" };
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &pk3var) && pk3var.value)
+      {
+         int p3_pak = PLUGIN_NONE;
+         if (!strcmp(pk3var.value, "rumble"))
+            p3_pak = PLUGIN_RAW;
+         else if (!strcmp(pk3var.value, "memory"))
+            p3_pak = PLUGIN_MEMPAK;
+         else if (!strcmp(pk3var.value, "biosensor"))
+            p3_pak = PLUGIN_BIO_PAK;
+
+         if (controller[2].control)
+            controller[2].control->Plugin = p3_pak;
+         else
+            pad_pak_types[2] = p3_pak;
+
+      }
+   }
+
+   {
+      struct retro_variable pk4var = { "parallel-n64-pak4" };
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &pk4var) && pk4var.value)
+      {
+         int p4_pak = PLUGIN_NONE;
+         if (!strcmp(pk4var.value, "rumble"))
+            p4_pak = PLUGIN_RAW;
+         else if (!strcmp(pk4var.value, "memory"))
+            p4_pak = PLUGIN_MEMPAK;
+         else if (!strcmp(pk4var.value, "biosensor"))
+            p4_pak = PLUGIN_BIO_PAK;
+
+         if (controller[3].control)
+            controller[3].control->Plugin = p4_pak;
+         else
+            pad_pak_types[3] = p4_pak;
+      }
+   }
+   
+   var.key = CORE_NAME "-allow-unaligned-dma";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      AllowUnalignedDMA = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-allow-large-roms";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      AllowLargeRoms = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-BilinearMode";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      bilinearMode = !strcmp(var.value, "3point") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-FXAA";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableFXAA = atoi(var.value);
+   }
+
+   /* Declared in libretro_core_options.h under the same guard. Querying it
+    * unconditionally makes the frontend log "Invalid value" on every launch of
+    * a GLES2 build, for an option the core never offered. */
+#ifndef HAVE_OPENGLES2
+   var.key = CORE_NAME "-gliden64-MultiSampling";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      MultiSampling = atoi(var.value);
+   }
+#endif
+
+   var.key = CORE_NAME "-gliden64-EnableLODEmulation";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableLODEmulation = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableFBEmulation";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableFBEmulation = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableN64DepthCompare";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "Compatible"))
+         EnableN64DepthCompare = 2; // dcCompatible
+      else if (!strcmp(var.value, "True"))
+         EnableN64DepthCompare = 1; // dcFast
+      else
+         EnableN64DepthCompare = 0; // dcDisable
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableCopyColorToRDRAM";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "TripleBuffer"))
+         EnableCopyColorToRDRAM = 3;
+      else if (!strcmp(var.value, "Async"))
+         EnableCopyColorToRDRAM = 2;
+      else if (!strcmp(var.value, "Sync"))
+         EnableCopyColorToRDRAM = 1;
+      else
+         EnableCopyColorToRDRAM = 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableCopyColorFromRDRAM";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableCopyColorFromRDRAM = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableCopyDepthToRDRAM";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "Software"))
+         EnableCopyDepthToRDRAM = 2;
+      else if (!strcmp(var.value, "FromMem"))
+         EnableCopyDepthToRDRAM = 1;
+      else
+         EnableCopyDepthToRDRAM = 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableHWLighting";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableHWLighting = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-CorrectTexrectCoords";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "Force"))
+         CorrectTexrectCoords = 2;
+      else if (!strcmp(var.value, "Auto"))
+         CorrectTexrectCoords = 1;
+      else
+         CorrectTexrectCoords = 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableInaccurateTextureCoordinates";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableInaccurateTextureCoordinates = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-BackgroundMode";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      BackgroundMode = !strcmp(var.value, "OnePiece") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableNativeResTexrects";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if(!strcmp(var.value, "False") || !strcmp(var.value, "Disabled"))
+      {
+         enableNativeResTexrects = 0; // NativeResTexrectsMode::ntDisable
+      }
+      else if(!strcmp(var.value, "Optimized"))
+      {
+         enableNativeResTexrects = 1; // NativeResTexrectsMode::ntOptimized
+      }
+      else if(!strcmp(var.value, "Unoptimized"))
+      {
+         enableNativeResTexrects = 1; // NativeResTexrectsMode::ntUnptimized (Note: upstream typo)
+      }
+   }
+
+   var.key = CORE_NAME "-gliden64-txFilterMode";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "Smooth filtering 1"))
+         txFilterMode = 1;
+      else if (!strcmp(var.value, "Smooth filtering 2"))
+         txFilterMode = 2;
+      else if (!strcmp(var.value, "Smooth filtering 3"))
+         txFilterMode = 3;
+      else if (!strcmp(var.value, "Smooth filtering 4"))
+         txFilterMode = 4;
+      else if (!strcmp(var.value, "Sharp filtering 1"))
+         txFilterMode = 5;
+      else if (!strcmp(var.value, "Sharp filtering 2"))
+         txFilterMode = 6;
+      else
+         txFilterMode = 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-txEnhancementMode";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "As Is"))
+         txEnhancementMode = 1;
+      else if (!strcmp(var.value, "X2"))
+         txEnhancementMode = 2;
+      else if (!strcmp(var.value, "X2SAI"))
+         txEnhancementMode = 3;
+      else if (!strcmp(var.value, "HQ2X"))
+         txEnhancementMode = 4;
+      else if (!strcmp(var.value, "HQ2XS"))
+         txEnhancementMode = 5;
+      else if (!strcmp(var.value, "LQ2X"))
+         txEnhancementMode = 6;
+      else if (!strcmp(var.value, "LQ2XS"))
+         txEnhancementMode = 7;
+      else if (!strcmp(var.value, "HQ4X"))
+         txEnhancementMode = 8;
+      else if (!strcmp(var.value, "2xBRZ"))
+         txEnhancementMode = 9;
+      else if (!strcmp(var.value, "3xBRZ"))
+         txEnhancementMode = 10;
+      else if (!strcmp(var.value, "4xBRZ"))
+         txEnhancementMode = 11;
+      else if (!strcmp(var.value, "5xBRZ"))
+         txEnhancementMode = 12;
+      else if (!strcmp(var.value, "6xBRZ"))
+         txEnhancementMode = 13;
+      else
+         txEnhancementMode = 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-txFilterIgnoreBG";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      // "Filter background textures; True|False" (true=filter, false=ignore)
+      txFilterIgnoreBG = !strcmp(var.value, "False") ? 1 : 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-txHiresEnable";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      txHiresEnable = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-txCacheCompression";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableTxCacheCompression = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-txHiresFullAlphaChannel";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      txHiresFullAlphaChannel = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableLegacyBlending";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      enableLegacyBlending = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableFragmentDepthWrite";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableFragmentDepthWrite = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+#if !defined(VC) && !defined(HAVE_OPENGLES2)
+   var.key = CORE_NAME "-gliden64-EnableShadersStorage";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableShadersStorage = !strcmp(var.value, "False") ? 0 : 1;
+   }
+#endif
+
+   var.key = CORE_NAME "-gliden64-EnableTextureCache";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableTextureCache = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableHiResAltCRC";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableHiResAltCRC = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableCopyAuxToRDRAM";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableCopyAuxToRDRAM = !strcmp(var.value, "False") ? 0 : 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableOverscan";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableOverscan = !strcmp(var.value, "Enabled") ? 1 : 0;
+   }
+
+   var.key = CORE_NAME "-gliden64-OverscanTop";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      OverscanTop = atoi(var.value);
+   }
+
+   var.key = CORE_NAME "-gliden64-OverscanLeft";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      OverscanLeft = atoi(var.value);
+   }
+
+   var.key = CORE_NAME "-gliden64-OverscanRight";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      OverscanRight = atoi(var.value);
+   }
+
+   var.key = CORE_NAME "-gliden64-OverscanBottom";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      OverscanBottom = atoi(var.value);
+   }
+
+   var.key = CORE_NAME "-gliden64-GLideN64IniBehaviour";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "late"))
+         GLideN64IniBehaviour = 0;
+      else if (!strcmp(var.value, "early"))
+         GLideN64IniBehaviour = 1;
+      else if (!strcmp(var.value, "disabled"))
+         GLideN64IniBehaviour = -1;
+   }
+
+   var.key = "parallel-n64-aspectratiohint";
+   var.value = NULL;
+
+   bool stretch = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && 0 == strcmp(var.value, "widescreen");
+
+   if (gfx_plugin == GFX_GLIDEN64)
+   {
+      var.key = CORE_NAME "-gliden64-viewport-hack";
+      var.value = NULL;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         if (!strcmp(var.value, "enabled")) {
+            screen_aspect_ratio = 16.0 / 9.0;
+            screen_width = screen_height * screen_aspect_ratio;
+            AspectRatio = 3; // Aspect::aAdjust
+         }
+         else if (!strcmp(var.value, "steamdeck")) {
+            screen_aspect_ratio = 16.0 / 10.0;
+            screen_width = screen_height * screen_aspect_ratio;
+            AspectRatio = 3; // Aspect::aAdjust
+         }
+         else if (stretch)
+         {
+            screen_aspect_ratio = 16.0 / 9.0;
+            screen_width = screen_height * screen_aspect_ratio;
+            AspectRatio = 2; // Aspect::a169
+         }
+         else
+         {
+            screen_aspect_ratio = 4.0 / 3.0;
+            AspectRatio = 1; // Aspect::a43
+         }
+      }
+   }
+
+   var.key = CORE_NAME "-gliden64-EnableNativeResFactor";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      EnableNativeResFactor = atoi(var.value);
+   }
+
+   var.key = CORE_NAME "-gliden64-LegacySm64ToolsHacks";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      LegacySm64ToolsHacks = !strcmp(var.value, "enabled");
+   }
+   else
+   {
+      LegacySm64ToolsHacks = 1;
+   }
+
+   var.key = CORE_NAME "-gliden64-RemoveFBBlackBars";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      RemoveFBBlackBars = !strcmp(var.value, "enabled");
+   }
+   else
+   {
+      RemoveFBBlackBars = 1;
+   }
+   
+   var.key = CORE_NAME "-OverrideSaveType";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if( !strcmp(var.value, "EEPROM_4KB") ) {
+         OverrideSaveType = 1;
+      } else if( !strcmp(var.value, "EEPROM_16KB") ) {
+         OverrideSaveType = 2;
+      } else if( !strcmp(var.value, "SRAM") ) {
+         OverrideSaveType = 3;
+      } else if( !strcmp(var.value, "FLASH_RAM") ) {
+         OverrideSaveType = 4;
+      } else if( !strcmp(var.value, "CONTROLLER_PACK") ) {
+         OverrideSaveType = 5;
+      } else if( !strcmp(var.value, "NONE") ) {
+         OverrideSaveType = 6;
+      } else {
+         OverrideSaveType = 0;
+      }
+   }
+   else
+   {
+      OverrideSaveType = 5;
+   }
+   
+   
+   var.key = CORE_NAME "-sdcard";
+   var.value = NULL;
+   if( environ_cb( RETRO_ENVIRONMENT_GET_VARIABLE, &var ) && var.value ) {
+      if( !strcmp(var.value, "SummerCart64") ) {
+         SdCardEmulationEnabled = 1;
+      }
+   }
+   
+   var.key = CORE_NAME "-rtc-savestate";
+   var.value = NULL;
+   if( environ_cb( RETRO_ENVIRONMENT_GET_VARIABLE, &var ) && var.value ) {
+      if( !strcmp(var.value, "enabled") ) {
+         RollbackRtcOnLoadState = 1;
+      }
+   }
+
+   /* Aleck64 dipswitches follow the core options live */
+   aleck64_apply_dips();
+}
+
+static void format_saved_memory(void)
+{
+   format_sram(saved_memory.sram);
+   format_eeprom(saved_memory.eeprom, sizeof(saved_memory.eeprom));
+   format_flashram(saved_memory.flashram);
+   {
+      int mp_i, mp_k;
+      for (mp_i = 0; mp_i < 4; ++mp_i)
+      {
+         uint32_t serial[6];
+         for (mp_k = 0; mp_k < 6; ++mp_k) serial[mp_k] = rand();
+         format_mempak(saved_memory.mempack[mp_i], serial,
+                       DEFAULT_MEMPAK_DEVICEID, DEFAULT_MEMPAK_BANKS,
+                       DEFAULT_MEMPAK_VERSION);
+      }
+   }
+   format_disk(saved_memory.disk);
+}
+
+bool retro_load_game(const struct retro_game_info *game)
+{
+   g_real_stop = 0; /* (AI-assisted) A prior deinit/unload must not suppress every new frame. */
+   format_saved_memory();
+
+   update_variables(true);
+   initial_boot = false;
+
+   init_audio_libretro();
+
+#ifdef HAVE_THR_AL
+   if (gfx_plugin != GFX_ANGRYLION)
+#endif
+   {
+      if (gfx_plugin == GFX_PARALLEL)
+      {
+         vulkan_inited = retro_init_vulkan();
+      }
+      else
+      {
+         vulkan_inited = false;
+      }
+
+      if (!vulkan_inited)
+      {
+         retro_init_gl(/*core*/ (gfx_plugin == GFX_GLIDEN64)
+                             || (gfx_plugin == GFX_PARALLEL));
+         gl_inited = true;
+      }
+   }
+
+   if (gl_inited)
+   {
+      // we are not vulkan, defer to opengl - it is assumed it always exists, otherwise fail
+      switch (gfx_plugin)
+      {
+         case GFX_PARALLEL:
+            gfx_plugin = GFX_GLIDEN64;
+            break;
+         default:
+            break;
+      }
+
+      switch (rsp_plugin)
+      {
+         case RSP_PARALLEL:
+            rsp_plugin = RSP_HLE;
+         default:
+            break;
+      }
+   }
+
+   g_aleck64_enabled = 0;
+   {
+      const uint8_t* game_data = (const uint8_t*)game->data;
+      size_t game_size = game->size;
+      uint8_t* file_buf = NULL;
+      uint8_t* zip_rom  = NULL;
+      size_t zip_size = 0;
+
+      /* need_fullpath core: the frontend usually passes only the path.
+       *
+       * Archives are handled without reading the archive into memory.  A zip
+       * only needs its end-of-central-directory tail, its central directory
+       * and the chosen entry's compressed bytes; those are read where they
+       * lie and inflated straight into the rom buffer.  Slurping first cost a
+       * second full-size allocation and a full read on top of the rom itself,
+       * most of it never looked at for a MAME set or a multi-rom archive. */
+      if (game_data == NULL && game->path != NULL)
+      {
+         int64_t len = 0;
+         char*   arc_path = NULL;
+         const char* zip_entry = NULL;
+         const char* arc = game->path;
+
+         /* This core sets block_extract, so when the user picks a rom from
+          * inside an archive the frontend hands us "archive.zip#entry"
+          * rather than an extracted file.  Split it, remembering which entry
+          * was asked for - but only when the whole path is not itself a
+          * file, since '#' is legal in a filename and a real file by that
+          * name has to keep winning. */
+         if (!path_is_valid(game->path))
+         {
+            const char* hash = strrchr(game->path, '#');
+
+            if (hash && hash != game->path)
+            {
+               size_t arc_len = (size_t)(hash - game->path);
+
+               if ((arc_path = (char*)malloc(arc_len + 1)))
+               {
+                  memcpy(arc_path, game->path, arc_len);
+                  arc_path[arc_len] = '\0';
+                  arc       = arc_path;
+                  zip_entry = hash + 1;
+               }
+            }
+         }
+
+         if (aleck64_load_zip_path(arc, zip_entry, &zip_rom, &zip_size))
+         {
+            free(arc_path);
+            /* the entry can be a 64DD disk as easily as a cartridge; route
+             * it the same way a loose file is routed */
+            if (!is_cartridge_rom(zip_rom))
+            {
+               disk_data = zip_rom;
+               disk_size = (uint32_t)zip_size;
+               goto content_ready;
+            }
+            cart_data = zip_rom;
+            cart_size = (uint32_t)zip_size;
+            goto content_ready;
+         }
+
+         if (!filestream_read_file(arc, (void**)&file_buf, &len) || len <= 0)
+         {
+            if (log_cb)
+               log_cb(RETRO_LOG_ERROR, "Failed to read content file: %s\n", game->path);
+            free(arc_path);
+            return false;
+         }
+         free(arc_path);
+         game_data = file_buf;
+         game_size = (size_t)len;
+      }
+
+      if (game_data == NULL)
+         return false;
+
+      if (game_size >= 4 && memcmp(game_data, "PK\x03\x04", 4) == 0
+          && aleck64_load_zip(game_data, game_size, &zip_rom, &zip_size)
+          && !is_cartridge_rom(zip_rom))
+      {
+         disk_data = zip_rom;
+         disk_size = (uint32_t)zip_size;
+         zip_rom   = NULL;
+      }
+      else if (zip_rom != NULL)
+      {
+         cart_data = zip_rom;
+         cart_size = (uint32_t)zip_size;
+      }
+      else if (is_cartridge_rom(game_data))
+      {
+         /* Take ownership of the buffer the read already produced rather than
+          * allocating a second one the size of the rom and copying across;
+          * both are released with free(). */
+         if (file_buf)
+         {
+            cart_data = file_buf;
+            file_buf  = NULL;
+         }
+         else if ((cart_data = malloc(game_size)))
+            memcpy(cart_data, game_data, game_size);
+         cart_size = game_size;
+      }
+      else
+      {
+         if (file_buf)
+         {
+            disk_data = file_buf;
+            file_buf  = NULL;
+         }
+         else if ((disk_data = malloc(game_size)))
+            memcpy(disk_data, game_data, game_size);
+         disk_size = game_size;
+      }
+
+      free(file_buf);
+   }
+
+content_ready:
+
+   /* A MAME set is recognised by its chip names while it is unpacked; a
+    * single-file dump, zipped or not, only by its header. */
+   if (aleck64_identify_rom(cart_data, cart_size))
+   {
+      /* ari64 knows the aleck64 SDRAM (tlb_page_host_map); the Hacktarux
+       * dynarec does not, cap it at the cached interp */
+      if (r4300_emumode > 1 && r4300_jit_backend != 0)
+         r4300_emumode = 1;
+   }
+
+   mupencorestop      = false;
+   g_rsp_force_halt   = 0;
+   /* Finish ROM load before doing anything funny,
+    * so we can return failure if needed. */
+   emu_step_load_data();
+
+   if (mupencorestop)
+      return false;
+
+   first_context_reset = true;
+
+   return true;
+}
+
+bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t num_info)
+{
+   if (game_type == SUBSYSTEM_CART_DISK)
+   {
+      if (!info[1].data || info[1].size == 0)
+         return false;
+      
+      disk_size = info[1].size;
+      disk_data = malloc(disk_size);
+      memcpy(disk_data, info[1].data, disk_size);
+
+      return retro_load_game(&info[0]);
+   }
+ 
+   return false;
+}
+
+void retro_unload_game(void)
+{
+    /* Force the RSP plugin's run loop to bail: the EmuThreadStep() below
+     * drives one more emulation step, and parallel-rsp's DoRspCycles spins
+     * until SP_STATUS_HALT, which a half-finished task may never reach.
+     * Cleared again in retro_load_game(). */
+    g_rsp_force_halt = 1;
+    mupen_main_stop();
+    first_time = 1;
+    if (g_EmulatorRunning) main_run(); /* (AI-assisted) Real teardown, not another frame slice. */
+
+    /* The run loop has stopped (mupencorestop above; r4300_execute torn
+     * down).  Mark the emulator stopped so the core lets us release the
+     * ROM image now: M64CMD_ROM_CLOSE bails while g_EmulatorRunning is
+     * set, which leaked the ROM buffer (up to 64 MiB, allocated by
+     * open_rom()) on every unload and made a subsequent load fail
+     * open_rom()'s "previous ROM image was not freed" guard.  The plugin
+     * romClosed teardown still runs later from mupen_main_exit() in
+     * retro_deinit(), unchanged. */
+    g_EmulatorRunning = 0;
+
+    CoreDoCommand(M64CMD_ROM_CLOSE, 0, NULL);
+    emu_initialized = false;
+    context_setup_first_init = false;
+}
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+static void glsm_exit(void)
+{
+#ifndef HAVE_SHARED_CONTEXT
+   if (g_real_stop)
+      return;
+#ifdef HAVE_THR_AL
+   if (gfx_plugin == GFX_ANGRYLION)
+      return;
+#endif
+#ifdef HAVE_PARALLEL
+   if (gfx_plugin == GFX_PARALLEL)
+      return;
+#endif
+   /* The per-frame glsm state bind/unbind only became live in 906a466c (it was
+    * dead under the old mupencorestop guard). It is what lets glide64 composite
+    * on the gl (compatibility) driver, but taking it live hangs gln64 and rice
+    * at startup on both gl and glcore -- those renderers were already correct on
+    * glcore with no per-frame bind. Restrict the live cycle to glide64 until the
+    * gln64/rice hang is root-caused; the other GL renderers keep their prior
+    * (no per-frame bind) behaviour, which is their known-good state. */
+   if (gfx_plugin != GFX_GLIDE64 && gfx_plugin != GFX_GLN64 && gfx_plugin != GFX_RICE)
+      return;
+   glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+#endif
+}
+
+static void glsm_enter(void)
+{
+#ifndef HAVE_SHARED_CONTEXT
+   if (g_real_stop)
+      return;
+#ifdef HAVE_THR_AL
+   if (gfx_plugin == GFX_ANGRYLION)
+      return;
+#endif
+#ifdef HAVE_PARALLEL
+   if (gfx_plugin == GFX_PARALLEL)
+      return;
+#endif
+   /* See glsm_exit(): the live per-frame bind is restricted to glide64, the only
+    * renderer it is validated to help on the gl driver. gln64 and rice hang with
+    * it live, so they keep their prior no-per-frame-bind behaviour here. */
+   if (gfx_plugin != GFX_GLIDE64 && gfx_plugin != GFX_GLN64 && gfx_plugin != GFX_RICE)
+      return;
+   glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+#endif
+}
+#endif
+
+/* RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE flag bits.  The libretro.h
+ * bundled in this tree defines the environment call number (47) but not
+ * the enum of returned flag values, so define the two bits we consult. */
+#ifndef RETRO_AV_ENABLE_VIDEO
+#define RETRO_AV_ENABLE_VIDEO (1 << 0)
+#endif
+#ifndef RETRO_AV_ENABLE_AUDIO
+#define RETRO_AV_ENABLE_AUDIO (1 << 1)
+#endif
+
+void retro_run (void)
+{
+   static bool updated = false;
+
+   /* Per-frame run-ahead / rewind hidden-frame detection.  The frontend
+    * toggles RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE around every
+    * retro_run: when the video bit is clear, the frame this call produces
+    * is discarded (a run-ahead future frame, or a rewind re-simulation).
+    * Latch it before stepping the device so the VI scan-out and the
+    * presentation path can both skip the work. */
+   {
+      int av_enable = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av_enable))
+         frame_hidden = (av_enable & RETRO_AV_ENABLE_VIDEO) ? 0 : 1;
+      else
+         frame_hidden = 0;
+   }
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+   {
+      static float last_aspect = 4.0 / 3.0;
+      struct retro_variable var;
+
+      update_variables(false);
+
+      var.key = "parallel-n64-aspectratiohint";
+      var.value = NULL;
+
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         float aspect_val = 4.0 / 3.0;
+         float aspectmode = 0;
+
+         if (!strcmp(var.value, "widescreen"))
+         {
+            aspect_val = 16.0 / 9.0;
+            aspectmode = 1;
+         }
+         else if (!strcmp(var.value, "normal"))
+         {
+            aspect_val = 4.0 / 3.0;
+            aspectmode = 0;
+         }
+
+         if (aspect_val != last_aspect)
+         {
+            screen_aspectmodehint = aspectmode;
+
+            switch (gfx_plugin)
+            {
+               case GFX_GLIDE64:
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+                  ChangeSize();
+#endif
+                  break;
+               case GFX_RICE:
+#ifdef HAVE_RICE
+                  /* Stub */
+#endif
+                  break;
+               case GFX_GLN64:
+#ifdef HAVE_GLN64
+                  /* Stub */
+#endif
+                  break;
+               case GFX_GLIDEN64:
+#ifdef HAVE_GLIDEN64
+                  /* Stub */
+#endif
+                  break;
+               case GFX_PARALLEL:
+#ifdef HAVE_PARALLEL
+                  /* Stub */
+#endif
+                  break;
+               case GFX_ANGRYLION:
+                  /* Stub */
+                  break;
+            }
+
+            last_aspect = aspect_val;
+            reinit_screen = true;
+         }
+      }
+   }
+
+   FAKE_SDL_TICKS += 16;
+
+   if (reinit_screen)
+   {
+      bool ret;
+      struct retro_system_av_info info;
+      /* SET_GEOMETRY cannot raise max_width/max_height, and a frame larger
+       * than the declared maximum is outside the libretro contract: the
+       * frontend sizes its frame buffers from the maximum, so an upscaled
+       * angrylion frame (2560 wide at 4x against a declared 640x480) comes
+       * out stretched and cut off. When the frame has outgrown what was
+       * declared, renegotiate with SET_SYSTEM_AV_INFO instead. */
+      bool outgrown = screen_width  > declared_max_width
+                   || screen_height > declared_max_height;
+      retro_get_system_av_info(&info);
+      switch (screen_aspectmodehint)
+      {
+         case 0:
+            info.geometry.aspect_ratio = 4.0 / 3.0;
+            break;
+         case 1:
+            info.geometry.aspect_ratio = 16.0 / 9.0;
+            break;
+      }
+      if (outgrown)
+         ret = environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+      else
+         ret = environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
+      reinit_screen = false;
+   }
+
+   {
+      switch (gfx_plugin)
+      {
+         case GFX_GLIDE64:
+         case GFX_GLN64:
+         case GFX_GLIDEN64:
+         case GFX_RICE:
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+            glsm_enter();
+#endif
+            break;
+         case GFX_PARALLEL:
+#if defined(HAVE_PARALLEL)
+            parallel_begin_frame();
+#endif
+            break;
+         case GFX_ANGRYLION:
+            break;
+      }
+
+      if (first_time)
+      {
+         first_time = 0;
+         emu_step_initialize();
+         /* Additional check for vioverlay not set at start */
+         update_variables(false);
+         gfx_set_filtering();
+         EmuThreadInit();
+      }
+      
+      EmuThreadStep();
+
+      switch (gfx_plugin)
+      {
+         case GFX_GLIDE64:
+         case GFX_GLN64:
+         case GFX_GLIDEN64:
+         case GFX_RICE:
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+            glsm_exit();
+#endif
+            break;
+         case GFX_PARALLEL:
+         case GFX_ANGRYLION:
+            break;
+      }
+   }
+
+   emu_step_render();
+
+   /* Hand over the audio the DAC clocked out during this frame, then
+    * emit it as a single batch.  Asking the AI here rather than waiting
+    * for the game to read AI_LEN is what makes the amount depend on how
+    * far the machine ran instead of on the game's polling pattern. */
+   ai_deliver_frame(&g_dev.ai);
+
+   /* Exactly one audio batch per retro_run iteration. */
+   flush_audio_libretro();
+}
+
+void retro_reset (void)
+{
+    /* Soft reset (console RESET button): raises the pre-NMI interrupt
+     * immediately and the NMI half a second later, giving the game's
+     * libultra reset handler its grace window to finish in-flight work
+     * such as EEPROM writes before the reboot.  The previous hard reset
+     * (power cycle) instead re-ran poweron_device() from inside
+     * gen_interrupt(), tearing down live device state mid-transaction. */
+    CoreDoCommand(M64CMD_RESET, 0, (void*)0);
+}
+
+void *retro_get_memory_data(unsigned type)
+{
+   switch (type)
+   {
+   case RETRO_MEMORY_SYSTEM_RAM: return g_dev.rdram.dram;
+   case RETRO_MEMORY_SAVE_RAM:   return &saved_memory;
+   }
+
+   return NULL;
+}
+
+size_t retro_get_memory_size(unsigned type)
+{
+   switch (type)
+   {
+   case RETRO_MEMORY_SYSTEM_RAM:
+      return RDRAM_MAX_SIZE;
+
+   case RETRO_MEMORY_SAVE_RAM:
+      if (type != RETRO_MEMORY_SAVE_RAM)
+            return 0;
+
+      if (g_dd_disk)
+            return sizeof(saved_memory);
+
+      return sizeof(saved_memory)-sizeof(saved_memory.disk);
+   }
+
+   return 0;
+}
+
+size_t retro_serialize_size (void)
+{
+    /* savestates_save_m64p writes a fixed-size state. The previous value
+     * (16788348 + 1024) was 208 bytes too small once the v1.3 Transfer Pak /
+     * MBC3 RTC block is written unconditionally for all four controllers
+     * (50 bytes each = 200) alongside the v1.4 RSP DMA FIFO block: the real
+     * trailer is 1232 bytes, not the 1024 that was budgeted, so retro_serialize
+     * overran the frontend's buffer by 208 bytes and corrupted the heap (a
+     * crash on Save State). The state is deterministic and the same size for
+     * every ROM and CPU core (measured 16789580), so size it to the actual
+     * maximum plus a real 1KB margin. Aleck64 romsets append their 4MB
+     * board SDRAM (v1.5 block), and E90 boards their sprite VRAM, palette
+     * and enable word (v1.6 block). */
+    return 16789580 + 1024
+         + (g_aleck64_enabled ? (ALECK64_SDRAM_SIZE + 16) : 0)
+         + (g_aleck64_e90 ? (ALECK64_E90_VRAM_SIZE + ALECK64_E90_PAL_SIZE + 4) : 0);
+}
+
+bool retro_serialize(void *data, size_t size)
+{
+    if (initializing)
+       return false;
+
+    if (savestates_save_m64p(data, size))
+        return true;
+
+    return false;
+}
+
+bool retro_unserialize(const void * data, size_t size)
+{
+    if (initializing)
+       return false;
+
+    if (savestates_load_m64p(data, size))
+    {
+        /* The rumble motor is a latched on/off state driven by the game
+         * writing to PAK_IO_RUMBLE; it is transient PIF/controller state and
+         * is not part of the savestate. Loading a state while the motor is
+         * latched on leaves the frontend rumbling indefinitely, since the
+         * matching "off" write from the game is never replayed. Force both
+         * motors off on all ports after a load; if the game still wants
+         * rumble, its next PAK_IO_RUMBLE write re-enables it within a frame. */
+        if (rumble.set_rumble_state)
+        {
+            unsigned port;
+            for (port = 0; port < 4; port++)
+            {
+                rumble.set_rumble_state(port, RETRO_RUMBLE_WEAK, 0);
+                rumble.set_rumble_state(port, RETRO_RUMBLE_STRONG, 0);
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/*Needed to be able to detach controllers
+ * for Lylat Wars multiplayer
+ *
+ * Only sets if controller struct is
+ * initialised as addon paks do.
+ */
+void retro_set_controller_port_device(unsigned in_port, unsigned device)
+{
+   if (in_port < 4)
+   {
+      switch(device)
+      {
+         case RETRO_DEVICE_NONE:
+            if (controller[in_port].control){
+               controller[in_port].control->Present = CONT_NONE;
+               break;
+            } else {
+               pad_present[in_port] = CONT_NONE;
+               break;
+            }
+
+         case RETRO_DEVICE_MOUSE:
+            if (controller[in_port].control){
+               controller[in_port].control->Present = CONT_MOUSE;
+               break;
+            } else {
+               pad_present[in_port] = CONT_MOUSE;
+               break;
+            }
+
+         case RETRO_DEVICE_ANALOG:
+            if (controller[in_port].control){
+               controller[in_port].control->Present = CONT_GCN;
+               break;
+            } else {
+               pad_present[in_port] = CONT_GCN;
+               break;
+            }
+
+         case RETRO_DEVICE_JOYPAD:
+         default:
+            if (controller[in_port].control){
+               controller[in_port].control->Present = CONT_JOYPAD;
+               break;
+            } else {
+               pad_present[in_port] = CONT_JOYPAD;
+               break;
+            }
+      }
+   }
+}
+
+/* Stubs */
+unsigned retro_api_version(void) { return RETRO_API_VERSION; }
+
+void retro_cheat_reset(void)
+{
+	cheat_delete_all(&g_cheat_ctx);
+}
+
+void retro_cheat_set(unsigned index, bool enabled, const char* codeLine)
+{
+	char name[256];
+	m64p_cheat_code mupenCode[256];
+	int matchLength=0,partCount=0;
+	uint32_t codeParts[256];
+	int cursor;
+
+	//Generate a name
+	sprintf(name, "cheat_%u",index);
+
+	//Break the code into Parts
+	for (cursor=0;;cursor++)
+   {
+      if (ISHEXDEC)
+         matchLength++;
+      else
+      {
+         if (matchLength)
+         {
+            char *codePartS = (char*)calloc(matchLength, sizeof(*codePartS));
+
+            strncpy(codePartS,codeLine+cursor-matchLength,matchLength);
+            codePartS[matchLength]=0;
+            codeParts[partCount++]=strtoul(codePartS,NULL,16);
+            matchLength=0;
+
+            free(codePartS);
+         }
+      }
+      if (!codeLine[cursor])
+         break;
+   }
+
+	//Assign the parts to mupenCode
+	for (cursor=0;2*cursor+1<partCount;cursor++)
+   {
+      mupenCode[cursor].address=codeParts[2*cursor];
+      mupenCode[cursor].value=codeParts[2*cursor+1];
+   }
+
+	//Assign to mupenCode
+	cheat_add_new(&g_cheat_ctx, name,mupenCode,partCount/2);
+	cheat_set_enabled(&g_cheat_ctx, name, enabled);
+}
+
+
+void vbo_disable(void);
+
+int retro_stop_stepping(void)
+{
+    return stop_stepping;
+}
+
+/* retro_return(true): a renderer finished a frame.  It only latches the
+ * frame for presentation at the end of the current slice; it neither
+ * presents nor ends the slice, and a second latch in the same slice
+ * simply replaces the first, so the frame shown is the last one done.
+ *
+ * retro_return(false): the VI interrupt - the one and only frame
+ * boundary.  Ends the slice; emu_step_render() then presents the
+ * latched frame, or the previous one again if nothing was latched. */
+int retro_return(bool just_flipping)
+{
+   if (mupencorestop)
+      return 0;
+
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+   /* Flush Glitch64's buffered vertices on every return - including
+    * the VI frame break, which can land mid-draw: the VBO state must
+    * not span glsm_exit()/glsm_enter() across the slice boundary. */
+   vbo_disable();
+#endif
+
+   if (just_flipping)
+   {
+      /* Latch the frame for presentation after the glsm state is unbound.
+       * video_cb must not run while glsm still has the core's GL state bound
+       * (FBO, program, textures): the frontend composites the hardware frame
+       * inside video_cb and needs its own restored state, exactly as upstream
+       * presents these renderers only after GLSM_CTL_STATE_UNBIND. Presenting
+       * from here -- inside the bind window, as OGL_SwapBuffers does -- left the
+       * screen black and corrupted the frontend on the compatibility gl driver
+       * (the glcore path tolerated the dirty state and so masked it). The frame
+       * still exists in the single hardware FBO when emu_step_render presents it
+       * immediately after glsm_exit, before the next slice clears it. */
+      frame_latched = true;
+      return 0;
+   }
+
+   stop_stepping = true;
+   frame_break = 1;
+   /* Break the device-execution loop for this frame. main_run() clears this
+    * and re-enters run_device() on the next slice; EmuThreadStep distinguishes
+    * a real stop (mupencorestop latched by CoreDoCommand STOP) from this
+    * per-frame yield via stop_stepping. */
+   mupencorestop = 1;
+   /* mupencorestop aliases ari64's hot-state stop; also set the active backend's
+    * stop via the accessor so the Hacktarux dynarec (which checks r4300->stop in
+    * gen_interrupt) actually yields at the VI frame boundary. */
+   *r4300_stop(&g_dev.r4300) = 1;
+
+   return 0;
+}

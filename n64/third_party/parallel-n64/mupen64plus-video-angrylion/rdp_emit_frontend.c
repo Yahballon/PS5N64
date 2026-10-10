@@ -1,0 +1,2328 @@
+/* rdp_emit_frontend.c -- self-contained geometry frontend for the angrylion
+ * HLE path. Reimplements the N64 matrix stack and vertex transform in C89,
+ * reading matrices/vertices from RDRAM and producing clip-space vertices for
+ * rdp_emit_bridge. The algorithm mirrors the documented N64 RSP geometry
+ * stage (and GLideN64's gSP.cpp), but uses no external plugin code.
+ *
+ * Inert until a microcode dispatch calls it. Build check:
+ *   gcc -std=c89 -pedantic -Wall -Wdeclaration-after-statement -Werror
+ */
+
+#include "rdp_emit_frontend.h"
+#include "rdp_emit_rsp.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "rdp_emit_recip.h"
+
+/* read a signed 16-bit big-endian halfword from RDRAM (N64 byte order) */
+/* RDRAM is stored as host-native 32-bit words in this core, so a sub-word
+ * read must undo the in-word byte order: on a little-endian host the N64
+ * (big-endian) byte at offset a lives at (a ^ 2) for 16-bit and (a ^ 3) for
+ * 8-bit, exactly as the RSP's u16()/u8() accessors do via S16/S8. */
+#ifdef MSB_FIRST
+#define RDRAM_S16 0u
+#define RDRAM_S8  0u
+#else
+#define RDRAM_S16 2u
+#define RDRAM_S8  3u
+#endif
+
+static int read_u8_n64(const unsigned char *rdram, unsigned int addr)
+{
+    return (int)rdram[addr ^ RDRAM_S8];
+}
+
+static int read_s16_be(const unsigned char *rdram, unsigned int addr)
+{
+    const unsigned short *p = (const unsigned short *)(rdram + (addr ^ RDRAM_S16));
+    int v = (int)*p;
+    if (v & 0x8000) v -= 0x10000;
+    return v;
+}
+
+static int read_u16_be(const unsigned char *rdram, unsigned int addr)
+{
+    const unsigned short *p = (const unsigned short *)(rdram + (addr ^ RDRAM_S16));
+    return (int)*p;
+}
+
+/* Matrices are s15.16 fixed point: element = (integer << 16) | fraction,
+ * held in an int32. 1.0 is 0x00010000. This matches the RSP's representation
+ * (it keeps the integer and fractional s16 halves separately; an s15.16 int32
+ * is the concatenation of the two). */
+#define FX_ONE 0x00010000
+
+static void mtx_identity(int32_t m[4][4])
+{
+    int i, j;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++)
+            m[i][j] = (i == j) ? FX_ONE : 0;
+}
+
+static void mtx_copy(int32_t d[4][4], int32_t s[4][4])
+{
+    int i, j;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++)
+            d[i][j] = s[i][j];
+}
+
+/* d = a * b (row-vector convention: v' = v * d, matching the N64 RSP).
+ * Each product of two s15.16 values is a 64-bit s31.32 intermediate; the
+ * column sum follows the microcode's mtx_multiply MAC chain exactly: the
+ * frac*frac partial of every product is truncated to its high half before
+ * accumulation (vmadl), unlike an exact 64-bit dot product which would keep
+ * those low bits until a single final shift. The difference is only a few
+ * LSBs per element, but the vertex w values -- and the 1/w reciprocals the
+ * triangle write derives from them -- inherit it, so the exact behaviour is
+ * required for bit-identical RDP commands. */
+/* Read one component of the RSP vertex transform out of the exact 64-bit
+ * accumulator sum, with the microcode's register-readback semantics: the
+ * integer half is the final vmadh's signed clamp of accumulator bits
+ * 47:16, the fraction half is the preceding vmadn's register -- clamped
+ * to 0xffff/0x0000 when the PARTIAL accumulator (total minus the final
+ * z*int_row term, which the last vmadh has not yet added) overflows the
+ * same window, and the raw low 16 bits otherwise. */
+static int32_t gsp_mvp_readback(int64_t total, int64_t last_int_term)
+{
+    int64_t part = total - (last_int_term << 16);
+    int32_t hi = (int32_t)(uint32_t)((uint64_t)total >> 16);
+    int32_t pw = (int32_t)(uint32_t)((uint64_t)part >> 16);
+    int32_t out_i, out_f;
+    out_i = (hi > 32767) ? 32767 : (hi < -32768) ? -32768 : hi;
+    if (pw > 32767)
+        out_f = 0xffff;
+    else if (pw < -32768)
+        out_f = 0x0000;
+    else
+        out_f = (int32_t)((uint64_t)total & 0xffff);
+    return (int32_t)(((uint32_t)(uint16_t)out_i << 16) | (uint32_t)out_f);
+}
+
+static void mtx_mul(int32_t d[4][4], int32_t a[4][4], int32_t b[4][4])
+{
+    int32_t r[4][4];
+    int i, j, k;
+    for (i = 0; i < 4; i++)
+    {
+        for (j = 0; j < 4; j++)
+        {
+            int64_t acc = 0;
+            for (k = 0; k < 4; k++)
+            {
+                int32_t ai = a[i][k] >> 16;
+                int32_t af = a[i][k] & 0xffff;
+                int32_t bi = b[k][j] >> 16;
+                int32_t bf = b[k][j] & 0xffff;
+                acc += (int64_t)((uint32_t)((uint32_t)af * (uint32_t)bf) >> 16);
+                acc += (int64_t)ai * bf;
+                acc += (int64_t)af * bi;
+                acc += ((int64_t)ai * bi) << 16;
+            }
+            /* vmadn/vmadh extraction: low half with the unsigned-low clamp,
+             * high half signed-clamped. In-range sums pass through. */
+            {
+                int64_t hi = acc >> 16;
+                int32_t out_i, out_f;
+                if (hi < -32768)      { out_i = -32768; out_f = 0x0000; }
+                else if (hi > 32767)  { out_i =  32767; out_f = 0xffff; }
+                else                  { out_i = (int32_t)hi; out_f = (int32_t)(acc & 0xffff); }
+                r[i][j] = (int32_t)(((uint32_t)out_i << 16) | (uint32_t)out_f);
+            }
+        }
+    }
+    mtx_copy(d, r);
+}
+
+/* Load an N64 fixed-point 4x4 matrix from RDRAM. The RSP stores the integer
+ * s16 halves of all 16 elements first (offset +0), then the fractional u16
+ * halves (offset +32); an element's s15.16 value is (int << 16) | frac. The
+ * matrix is stored transposed for the row-vector transform, with the
+ * translation in the last row, so element (i,j) is read from linear slot
+ * (i*4 + j). read_s16_be/read_u16_be apply the in-word byte swap. */
+static void load_n64_matrix(int32_t m[4][4], const unsigned char *rdram, unsigned int addr)
+{
+    int i, j;
+    unsigned int int_base = addr;
+    unsigned int frac_base = addr + 32;
+    for (i = 0; i < 4; i++)
+    {
+        for (j = 0; j < 4; j++)
+        {
+            int ofs = (i * 4 + j) * 2;
+            int ip = read_s16_be(rdram, int_base + (unsigned int)ofs);
+            int fp = read_u16_be(rdram, frac_base + (unsigned int)ofs);
+            m[i][j] = (int32_t)(((uint32_t)(int16_t)ip << 16) | ((uint32_t)fp & 0xffffu));
+        }
+    }
+}
+
+void gsp_init(GSPState *s)
+{
+    int i;
+    s->clip_ratio = 2;
+    s->clip_near_z = 0;
+    s->clip_fan_first = 0;
+    s->clip_reject = 0;
+    s->no_texgen = 0;
+    s->reflect_valid = 0;
+    s->branch_z_mode = 0;
+    s->branch_z_mode = 0;
+    s->tri_dx_scale  = 0x4000;
+    s->tri_idy_scale = 0x0008;
+    s->tri_frac_mask = (int32_t)0xffff;
+    s->tri_vcr_bound = 0x1cc;
+    mtx_identity(s->projection);
+    for (i = 0; i < GSP_MTX_STACK; i++)
+        mtx_identity(s->modelview[i]);
+    s->modelview_top = 0;
+    mtx_identity(s->combined);
+    s->combined_valid = 0;
+    s->viewport.vscale_x = 160 << 16;
+    s->viewport.vscale_y = 120 << 16;
+    s->viewport.vtrans_x = 160 << 16;
+    s->viewport.vtrans_y = 120 << 16;
+    s->viewport.vscale_z = 511 << 16;
+    s->viewport.vtrans_z = 511 << 16;
+    s->tex_scale_s = 0x8000u;   /* G_TEXTURE scale, S0.16 with 0x8000 == 1.0 */
+    s->tex_scale_t = 0x8000u;
+    s->persp_norm = 0xffffu; /* default until gSPPerspNormalize sets it */
+    s->fog_m = 0;
+    s->fog_o = 0;
+    s->dkr_shade_alpha_zero = 0;
+    s->viewport.persp_norm = 0xffffu;
+    s->viewport.rsp_screen_model = 1;
+    s->viewport.tri_dx_scale  = s->tri_dx_scale;
+    s->viewport.tri_idy_scale = s->tri_idy_scale;
+    s->viewport.tri_frac_mask = s->tri_frac_mask;
+    s->viewport.tri_vcr_bound = s->tri_vcr_bound;
+
+    /* default lighting: no directional lights, white ambient (255) so geometry
+     * flagged G_LIGHTING before any light load is not pure black. */
+    s->num_lights = 0;
+    for (i = 0; i < GSP_MAX_LIGHTS; i++)
+    {
+        s->light_rgb[i][0] = 255;
+        s->light_rgb[i][1] = 255;
+        s->light_rgb[i][2] = 255;
+        s->light_dir[i][0] = 0;
+        s->light_dir[i][1] = 0;
+        s->light_dir[i][2] = 0;
+        s->light_raw[i][0] = 0;
+        s->light_raw[i][1] = 0;
+        s->light_raw[i][2] = 0;
+        s->light_kc[i] = 0;
+        s->light_kl[i] = 0;
+        s->light_kq[i] = 0;
+        s->light_pos[i][0] = 0;
+        s->light_pos[i][1] = 0;
+        s->light_pos[i][2] = 0;
+        if (i < 2)
+        {
+            s->lookat[i][0] = 0;
+            s->lookat[i][1] = 0;
+            s->lookat[i][2] = 0;
+            s->lookat_raw[i][0] = 0;
+            s->lookat_raw[i][1] = 0;
+            s->lookat_raw[i][2] = 0;
+            s->lights_valid = 0;
+        }
+    }
+    /* F3DEX seeds a default LookAt at task boot so that environment-mapped
+     * texture generation (G_TEXTURE_GEN) works before -- or entirely without
+     * -- an explicit gSPLookAt. Mario Kart 64's attract-mode Nintendo logo
+     * relies on this: it never issues a LookAt MOVEMEM, so with a zeroed
+     * direction rsp_texgen collapses every vertex to the same texel and the
+     * reflective chrome reads as a flat gold blob.
+     *
+     * The S texgen coordinate is generated against slot 0 and T against slot 1.
+     * The microcode's default orients them so S follows +Y and T follows +X
+     * (the transpose of the gdSPDefLookAt right=+X / up=+Y convention): seed
+     * slot 0 = +Y and slot 1 = +X to reproduce the LLE reference's S/T mapping
+     * exactly -- the opposite assignment leaves the reflection's specular band
+     * mirrored and oversaturated. The s8 magnitude matches FTOFRAC8(1.0); lists
+     * that load their own LookAt overwrite both slots. */
+    s->lookat_raw[0][0] = 0;
+    s->lookat_raw[0][1] = 0x7f;
+    s->lookat_raw[0][2] = 0;
+    s->lookat_raw[1][0] = 0x7f;
+    s->lookat_raw[1][1] = 0;
+    s->lookat_raw[1][2] = 0;
+    s->tex_tile = 0;
+    s->tex_level = 0;
+    s->tex_w = 32;
+    s->tex_h = 32;
+}
+
+/* The microcode's matrix stack lives in RDRAM, in the area the game
+ * names with the OSTask dram_stack / dram_stack_size fields. A push
+ * DMAs the current top out to the write pointer and a pop DMAs the
+ * previous slot back in, so the walker mirrors both directions: the
+ * matrix a pop restores is whatever the RDRAM slot holds, and a push
+ * that has reached base + size is dropped outright -- gspF3D skips the
+ * DMA and the pointer bump with a beq against the limit word and only
+ * performs the concatenation. */
+static void store_n64_matrix(unsigned char *rdram, unsigned int addr,
+                             int32_t m[4][4])
+{
+    int e;
+    for (e = 0; e < 16; e++)
+    {
+        int32_t v = m[e >> 2][e & 3];
+        unsigned int hi = addr + (unsigned int)(e * 2);
+        unsigned int lo = hi + 32u;
+        *(unsigned short *)(rdram + (hi ^ RDRAM_S16)) =
+            (unsigned short)((v >> 16) & 0xffff);
+        *(unsigned short *)(rdram + (lo ^ RDRAM_S16)) =
+            (unsigned short)(v & 0xffff);
+    }
+}
+
+static unsigned char *s_stack_rdram;
+
+void gsp_set_matrix_stack(GSPState *s, unsigned char *rdram,
+                          unsigned int base, unsigned int size)
+{
+    s_stack_rdram = rdram;
+    s->mtx_stack_base = base;
+    s->mtx_stack_ptr = base;
+    s->mtx_stack_limit = base + size;
+}
+
+void gsp_matrix_load(GSPState *s, const unsigned char *rdram, unsigned int addr,
+                     int projection, int load, int push)
+{
+    int32_t m[4][4];
+    load_n64_matrix(m, rdram, addr);
+
+    if (projection)
+    {
+        if (load)
+            mtx_copy(s->projection, m);
+        else
+            mtx_mul(s->projection, m, s->projection);
+    }
+    else
+    {
+        if (push && s->modelview_top < GSP_MTX_STACK - 1)
+        {
+            /* Space Station Silicon Valley hands the microcode an
+             * 0x80-byte stack -- two slots -- and its object lists push
+             * four deep. The pushes past the limit never happen on the
+             * RSP, and modelling the drop is what keeps the later pops
+             * pairing with the pushes the microcode actually performed;
+             * a walker with a private 16-deep stack restores matrices
+             * the RSP never saved, and every transform downstream rides
+             * the wrong parent (the crash-pod interior transforms into
+             * degenerate clip space and the scene renders black). */
+            if (s->mtx_stack_base != 0u)
+            {
+                if (s->mtx_stack_ptr != s->mtx_stack_limit)
+                {
+                    if (s_stack_rdram != 0)
+                        store_n64_matrix(s_stack_rdram, s->mtx_stack_ptr,
+                                         s->modelview[s->modelview_top]);
+                    s->mtx_stack_ptr += 0x40u;
+                    mtx_copy(s->modelview[s->modelview_top + 1],
+                             s->modelview[s->modelview_top]);
+                    s->modelview_top++;
+                }
+            }
+            else
+            {
+                mtx_copy(s->modelview[s->modelview_top + 1],
+                         s->modelview[s->modelview_top]);
+                s->modelview_top++;
+            }
+        }
+        if (load)
+            mtx_copy(s->modelview[s->modelview_top], m);
+        else
+            mtx_mul(s->modelview[s->modelview_top], m, s->modelview[s->modelview_top]);
+    }
+    /* load_mtx zeroes mvpValid with a word write that also covers
+     * lightsValid, for projection loads as well as modelview. */
+    s->lights_valid = 0;
+    s->combined_valid = 0;
+}
+
+/* DKR (F3DDKR) indexed matrix load (gSPMatrixDKR). Unlike the F3DEX push/pop
+ * stack, DKR keeps a small bank of model matrices addressed by `index` (slot
+ * 0/1/2) and bakes projection into them, so the projection matrix is identity
+ * and the combined transform is simply the active modelview slot. Semantics
+ * mirror GLideN64's gSPDMAMatrix: load into modelview[index] (copy, or
+ * multiply against slot 0 when `multiply`), set that slot active, and reset
+ * projection to identity. */
+void gsp_matrix_dkr(GSPState *s, const unsigned char *rdram, unsigned int addr,
+                    int index, int multiply)
+{
+    int32_t m[4][4];
+    if (index < 0 || index >= GSP_MTX_STACK)
+        index = 0;
+    load_n64_matrix(m, rdram, addr);
+    if (multiply)
+        mtx_mul(s->modelview[index], m, s->modelview[0]);
+    else
+        mtx_copy(s->modelview[index], m);
+    s->modelview_top = index;
+    mtx_identity(s->projection);
+    s->lights_valid = 0;
+    s->combined_valid = 0;
+}
+
+/* DKR (F3DDKR) active-matrix select (gSPSelectMatrixDKR / G_MW_MVPMATRIX). */
+void gsp_select_matrix_dkr(GSPState *s, int index)
+{
+    if (index < 0 || index >= GSP_MTX_STACK)
+        return;
+    s->modelview_top = index;
+    s->combined_valid = 0;
+    s->lights_valid = 0;
+}
+
+void gsp_matrix_pop(GSPState *s, const unsigned char *rdram)
+{
+    /* do_popmtx only zeroes mvpValid/lightsValid when bytes were
+     * actually popped from the matrix stack. The pop reloads the top
+     * from the RDRAM slot; at the base it is a complete no-op (the
+     * microcode branches past the DMA and the pointer store). */
+    if (s->mtx_stack_base != 0u)
+    {
+        if (s->mtx_stack_ptr > s->mtx_stack_base && rdram != 0)
+        {
+            if (s->modelview_top > 0)
+                s->modelview_top--;
+            s->mtx_stack_ptr -= 0x40u;
+            load_n64_matrix(s->modelview[s->modelview_top],
+                            rdram, s->mtx_stack_ptr);
+            s->combined_valid = 0;
+            s->lights_valid = 0;
+        }
+        return;
+    }
+    if (s->modelview_top > 0)
+    {
+        s->modelview_top--;
+        s->combined_valid = 0;
+        s->lights_valid = 0;
+    }
+}
+
+/* gSPCullDisplayList: AND the stored VCH screen outcodes -- the x/y/z
+ * lanes on both sides, the same 0x7070 mask the triangle trivial
+ * reject applies to the per-vertex flag halfword -- across the vertex
+ * span. Nonzero means every vertex sits outside the same screen plane
+ * and the microcode returns from the current display list on the spot,
+ * through the G_ENDDL code. Everything after the command in that list
+ * is skipped, so the walker must stop the list rather than merely skip
+ * the draw: a culled tail can carry matrix and other state the
+ * microcode never executes. */
+int gsp_culldl_test(const GSPState *s, int v0, int vn)
+{
+    unsigned int acc = ~0u;
+    int i;
+    if (v0 < 0 || vn < v0 || vn >= GSP_MAX_VERTICES)
+        return 0;
+    for (i = v0; i <= vn; i++)
+        acc &= (unsigned int)s->vtx[i].clip;
+    return (acc & 0x7070u) != 0u;
+}
+
+void gsp_set_alpha_light(GSPState *s, const unsigned char *rdram,
+                         unsigned int addr, int index)
+{
+    int32_t d[3];
+    int64_t mag_sq;
+    int64_t mag;
+    int k;
+    if (index < 0 || index > 1)
+        return;
+    /* F3DFLX's "alpha light" (gSPLookAtY of an unk_Light) is the reflection
+     * direction. Unlike a normal s8 lookat, its direction is an s16 vector
+     * (the game stores the unit reflection vector * 16383) at byte offset 8.
+     * Scale it into the s8 unit range the model-space transform consumes; the
+     * transform's own vrsq pass then renormalizes it RSP-exactly. */
+    d[0] = (int32_t)read_s16_be(rdram, addr + 8);
+    d[1] = (int32_t)read_s16_be(rdram, addr + 10);
+    d[2] = (int32_t)read_s16_be(rdram, addr + 12);
+    mag_sq = (int64_t)d[0] * d[0] + (int64_t)d[1] * d[1] + (int64_t)d[2] * d[2];
+    /* integer floor(sqrt) of the magnitude (no float in the RSP path) */
+    mag = 0;
+    {
+        int64_t bit = (int64_t)1 << 46;
+        int64_t v = mag_sq;
+        while (bit > v)
+            bit >>= 2;
+        while (bit != 0)
+        {
+            if (v >= mag + bit)
+            {
+                v -= mag + bit;
+                mag = (mag >> 1) + bit;
+            }
+            else
+                mag >>= 1;
+            bit >>= 2;
+        }
+    }
+    if (mag < 1)
+        mag = 1;
+    for (k = 0; k < 3; k++)
+    {
+        int64_t num = (int64_t)d[k] * 127;
+        int32_t v;
+        if (num >= 0)
+            v = (int32_t)((num + mag / 2) / mag);
+        else
+            v = -(int32_t)((-num + mag / 2) / mag);
+        if (v > 127)
+            v = 127;
+        else if (v < -128)
+            v = -128;
+        s->lookat_raw[index][k] = v;
+    }
+    s->lights_valid = 0;   /* force the model-space re-transform */
+}
+
+void gsp_set_lookat(GSPState *s, const unsigned char *rdram,
+                    unsigned int addr, int index)
+{
+    if (index < 0 || index > 1)
+        return;
+    /* Raw s8 lookat direction; transformed into model space together with
+     * the directional lights under the same lightsValid cache. */
+    s->lookat_raw[index][0] = (int)(signed char)read_u8_n64(rdram, addr + 8);
+    s->lookat_raw[index][1] = (int)(signed char)read_u8_n64(rdram, addr + 9);
+    s->lookat_raw[index][2] = (int)(signed char)read_u8_n64(rdram, addr + 10);
+    /* G_MOVEMEM does not touch lightsValid: the RSP keeps using the
+     * previously transformed directions until a matrix load, a real
+     * matrix pop, or a G_MW_NUMLIGHT write invalidates them. */
+}
+
+/* Transform the lookat and directional light vectors from world space into
+ * model space and normalize them, mirroring the RSP's lazy
+ * continue_light_dir_xfrm pass: newDir = origDir * transpose(MV[0:2][0:2]),
+ * normalized and stored as s8. Vertex shading then dots these unit s8
+ * directions against the raw (untransformed, unnormalized) s8 vertex
+ * normal, so authored normal magnitudes scale the contribution exactly as
+ * on the RSP, while light vector magnitudes are normalized away. The pass
+ * runs at most once per matrix/light change (lightsValid). */
+static void gsp_light_dir_xfrm(GSPState *s)
+{
+    int32_t (*M)[4] = s->modelview[s->modelview_top];
+    int k;
+    for (k = -2; k < s->num_lights; k++)
+    {
+        const int32_t *raw = (k < 0) ? s->lookat_raw[k + 2] : s->light_raw[k];
+        int32_t *out       = (k < 0) ? s->lookat[k + 2]     : s->light_dir[k];
+        rsp_light_dir_xfrm_one((const int32_t (*)[4])M, raw, out);
+    }
+    s->lights_valid = 1;
+}
+
+void gsp_set_vertex_color_base(GSPState *s, unsigned int base)
+{
+    s->pd_cbase = base;
+    s->pd_ci = 1;
+}
+
+void gsp_set_fog(GSPState *s, int fm, int fo)
+{
+    s->fog_m = fm;
+    s->fog_o = fo;
+}
+
+void gsp_set_dkr_shade_alpha_zero(GSPState *s, int on)
+{
+    s->dkr_shade_alpha_zero = on ? 1 : 0;
+}
+
+void gsp_set_rsp_screen_model(GSPState *s, int on)
+{
+    s->viewport.rsp_screen_model = on ? 1 : 0;
+}
+
+void gsp_task_reset(GSPState *s)
+{
+    s->pd_ci = 0;
+    s->cbfd = 0;
+    s->cbfd_nbase = 0;
+    {
+        int ci;
+        for (ci = 0; ci < 16; ci++)
+            s->cbfd_cmod[ci] = 0;
+    }
+    s->acclaim = 0;
+    s->acclaim_active = 0;
+    s->acclaim_nlights = 0;
+    s->accl_clampmax = 0;
+    s->pd_cbase = 0;
+    /* Each task starts under the F3D-family screen model; the F3DDKR
+     * walker opts out at its entry. Without the per-task restore a DKR
+     * task would leave the exact-divide mode behind for a later
+     * F3D/F3DEX2 task on the shared GSPState. */
+    s->viewport.rsp_screen_model = 1;
+    /* The RSP task boot resets the matrix-stack pointer; display lists are
+     * free to leave pushes unbalanced. Without this per-task reset the HLE
+     * stack ratchets up to its cap over a few frames and every pushed
+     * (skeleton/nested) draw transforms with a stale top-of-stack matrix. */
+    s->modelview_top = 0;
+    s->combined_valid = 0;
+    /* The task's DMEM data load restores the default guard-band clip
+     * ratio; a list that wants another ratio re-sends G_MW_CLIP. */
+    s->clip_ratio = 2;
+    s->clip_near_z = 0;
+    s->clip_fan_first = 0;
+    s->clip_reject = 0;
+    s->no_texgen = 0;
+    s->reflect_valid = 0;
+}
+
+void gsp_combine_matrices(GSPState *s)
+{
+    mtx_mul(s->combined, s->modelview[s->modelview_top], s->projection);
+    s->combined_valid = 1;
+}
+
+/* gSPForceMatrix: G_MOVEMEM straight into the combined-matrix DMEM slot,
+ * 16 bytes per command across G_MV_MATRIX_1..4 (byte offsets 0/16/32/48
+ * of the 64-byte N64 matrix: 32 bytes of s16 integer parts row-major,
+ * then 32 bytes of fractions). The forced product stays valid until the
+ * next G_MTX load rebuilds it from the stacks. */
+void gsp_force_matrix_chunk(GSPState *s, const unsigned char *rdram,
+                            unsigned int addr, unsigned int offset)
+{
+    int k;
+    for (k = 0; k < 8; k++)
+    {
+        unsigned int v = ((unsigned int)rdram[(addr + (unsigned int)k * 2u) ^ 3u] << 8)
+                       | (unsigned int)rdram[(addr + (unsigned int)k * 2u + 1u) ^ 3u];
+        int elem = (int)((offset & 16u) ? 8 : 0) + k;
+        int rr = elem >> 2, cc = elem & 3;
+        if (offset < 32u)
+            s->combined[rr][cc] = (int32_t)(((uint32_t)v << 16)
+                                | ((uint32_t)s->combined[rr][cc] & 0xffffu));
+        else
+            s->combined[rr][cc] = (int32_t)(((uint32_t)s->combined[rr][cc]
+                                             & 0xffff0000u) | v);
+    }
+    s->combined_valid = 1;
+}
+
+void gsp_set_viewport(GSPState *s, const unsigned char *rdram, unsigned int addr)
+{
+    /* N64 Vp: vscale[0..3] then vtrans[0..3] (s16). X/Y are 10.2 fixed (the .2
+     * sub-pixel), so the pixel value is raw/4 -> in s15.16 that is raw<<14. Z
+     * (vscale[2]/vtrans[2] = G_MAXZ/2 = 511) is a plain integer -> raw<<16. All
+     * stored as s15.16, integer-only (no float). */
+    s->viewport.vscale_x = (int32_t)read_s16_be(rdram, addr + 0) << 14;
+    s->viewport.vscale_y = (int32_t)read_s16_be(rdram, addr + 2) << 14;
+    s->viewport.vscale_z = (int32_t)read_s16_be(rdram, addr + 4) << 16;
+    s->viewport.vtrans_x = (int32_t)read_s16_be(rdram, addr + 8) << 14;
+    s->viewport.vtrans_y = (int32_t)read_s16_be(rdram, addr + 10) << 14;
+    s->viewport.vtrans_z = (int32_t)read_s16_be(rdram, addr + 12) << 16;
+}
+
+void gsp_set_texture(GSPState *s, unsigned int scale_s, unsigned int scale_t,
+                     int tile, int level, int tex_w, int tex_h)
+{
+    s->tex_scale_s = scale_s;
+    s->tex_scale_t = scale_t;
+    s->tex_tile = tile;
+    s->tex_level = level;
+    s->tex_w = tex_w;
+    s->tex_h = tex_h;
+}
+
+/* N64 Vertex struct in RDRAM (16 bytes), big-endian:
+ *   s16 y, x;  u16 flag; s16 z;  s16 t, s;  color/normal[4] */
+/* Snapshot the screen-space values for a freshly written vertex under the
+ * currently active viewport/perspNorm, mirroring the microcode's
+ * vertices_store (G_VTX and the clipper's generated vertices both pass
+ * through it; the triangle write only reloads the stored results). */
+static void gsp_clip_vertex_flags(const GSPState *st, GSPVertex *vt);
+
+static void gsp_vertex_screen(GSPState *s, GSPVertex *vt)
+{
+    BridgeVertex bv;
+    bv.cx = vt->cx; bv.cy = vt->cy; bv.cz = vt->cz; bv.cw = vt->cw;
+    bridge_compute_screen(&bv, &s->viewport,
+                          &vt->scr_x, &vt->scr_y, &vt->scr_z,
+                          &vt->w_raw, &vt->rsp_ok, &vt->rsp_invw);
+    vt->rs_ndc2z = rsp_vtx_last_ndc2z();
+    vt->rs_pw = rsp_vtx_last_pw();
+    vt->rs_outcode = rsp_vtx_last_outcode();
+}
+
+/* Acclaim custom lighting (Turok 2/3, Armorines, South Park). The four titles'
+ * shared microcode carries a non-standard point-light approximation: instead of
+ * the stock normal-dot-direction diffuse term, it floods vertices with light
+ * whose intensity falls off with the L1 (Manhattan) distance from each light to
+ * the vertex. Reverse-engineered from the RSP overlay (the Manhattan-sum vabs at
+ * IMEM 0x1698) and validated bit-exact against the cxd4 LLE oracle. For each of
+ * the loaded lights:
+ *   d      = light_pos - vertex_pos            (eye space, per-axis s16)
+ *   sum    = |d.x| + |d.y| + |d.z|             (Manhattan distance)
+ *   inten  = |min(sum - A, 0)| * B  (as u16)   (0 when sum > A: light ignored)
+ *   contribution per channel = ((colour<<7) * inten) >> 16
+ *   colour += contribution, clamped to clampmax
+ * The RSP keeps the working vertex colour as an s8.7 fixed-point value (the
+ * 8-bit vertex colour shifted left by 7); the final vertex colour is that value
+ * shifted back down by 7. G_LIGHTING is switched off while this runs, so the
+ * effect is purely additive on top of the vertex's own colour bytes. The light
+ * positions are eye-space, so the caller passes the vertex position after the
+ * combined-matrix transform (cx,cy,cz >> 16), not the raw object coordinates. */
+static void acclaim_light(GSPState *s, int32_t ex, int32_t ey, int32_t ez,
+                          int32_t *r8, int32_t *g8, int32_t *b8)
+{
+    int li;
+    int32_t clampmax = s->accl_clampmax;
+    /* start from the base vertex colour promoted to the s8.7 domain */
+    int32_t cr = (*r8 & 0xff) << 7;
+    int32_t cg = (*g8 & 0xff) << 7;
+    int32_t cb = (*b8 & 0xff) << 7;
+    if (clampmax <= 0)
+        clampmax = 0x7f80;
+    for (li = 0; li < s->acclaim_nlights; li++)
+    {
+        int32_t dx, dy, dz, sum, sma, inten, lr, lg, lb, contrib;
+        /* The ucode loads the A halfword and tests bit 0x8000; when set the
+         * light is disabled and the accumulate is skipped entirely. A is
+         * otherwise a small positive s16 cutoff, so the raw u16 top bit is the
+         * disable flag. */
+        if ((s->accl_a[li] & 0x8000) != 0)
+            continue;
+        dx = s->accl_pos[li][0] - ex;
+        dy = s->accl_pos[li][1] - ey;
+        dz = s->accl_pos[li][2] - ez;
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        if (dz < 0) dz = -dz;
+        sum = dx + dy + dz;
+        sma = sum - s->accl_a[li];
+        if (sma > 0)                    /* min(sum - A, 0): far light ignored */
+            sma = 0;
+        if (sma < 0)
+            sma = -sma;                 /* |sma| */
+        inten = (sma * s->accl_b[li]) & 0xffff;   /* u16 intensity */
+        if (inten == 0)
+            continue;
+        lr = (s->accl_rgb[li][0] & 0xff) << 7;
+        lg = (s->accl_rgb[li][1] & 0xff) << 7;
+        lb = (s->accl_rgb[li][2] & 0xff) << 7;
+        contrib = (int32_t)(((int64_t)lr * (int64_t)inten) >> 16);
+        cr += contrib;
+        if (cr > 32767) cr = 32767;
+        if (cr > clampmax) cr = clampmax;
+        contrib = (int32_t)(((int64_t)lg * (int64_t)inten) >> 16);
+        cg += contrib;
+        if (cg > 32767) cg = 32767;
+        if (cg > clampmax) cg = clampmax;
+        contrib = (int32_t)(((int64_t)lb * (int64_t)inten) >> 16);
+        cb += contrib;
+        if (cb > 32767) cb = 32767;
+        if (cb > clampmax) cb = clampmax;
+    }
+    /* back to 0..255 from the s8.7 accumulator */
+    *r8 = (cr >> 7) & 0xff;
+    *g8 = (cg >> 7) & 0xff;
+    *b8 = (cb >> 7) & 0xff;
+}
+
+void gsp_vertex(GSPState *s, const unsigned char *rdram, unsigned int addr,
+                int n, int v0)
+{
+    int i;
+    if (!s->combined_valid)
+        gsp_combine_matrices(s);
+
+    for (i = 0; i < n; i++)
+    {
+        unsigned int base = addr + (unsigned int)i * (s->pd_ci ? 12u : 16u);
+        /* Perfect Dark's colour-indexed vertex is a 12-byte record whose
+         * position (x,y,z at +0/+2/+4) and texel (s,t at +8/+10) fields sit
+         * at the stock F3D offsets; the two bytes the stock format spends on
+         * the first half of the RGBA/normal instead hold a u16 colour index
+         * at +6. The actual colour/normal bytes live in a separate table
+         * set by the 0x07 G_VTXCOLORBASE command, indexed by (ci & 0xff);
+         * the entry layout matches the stock inline bytes (r,g,b,a, or
+         * nx,ny,nz,a under G_LIGHTING). Verified frame-exact against the
+         * cxd4 LLE RSP by booting the retail cart live (the interior scene
+         * matches at 98.2% within-tolerance pixels, the same slope/texel
+         * ULP residue class as the rest of the family; index +4 or a
+         * transposed x/y drop it below 15%). */
+        unsigned int cofs = s->pd_ci
+            ? (s->pd_cbase
+               + ((unsigned int)read_u16_be(rdram, base + 6) & 0xffu))
+            : (base + 12u);
+        int idx = v0 + i;
+        int32_t ox, oy, oz;
+        int64_t cx, cy, cz, cw;
+        int st_s, st_t;
+        int has_refl = 0;
+        int32_t refl_a = 0;
+        GSPVertex *vt;
+        if (idx < 0 || idx >= GSP_MAX_VERTICES)
+            continue;
+        vt = &s->vtx[idx];
+
+        /* Model-space position is an integer s16; the combined matrix is
+         * s15.16. The product (integer * s15.16) is already an s15.16 value,
+         * and the column sum is accumulated at 64-bit width like the RSP's
+         * 48-bit vector accumulator. The stored value is NOT a plain int32
+         * truncation of the sum: the microcode's transform chain is
+         * vmudn/vmadh of the translation row, then the vmadn/vmadh pairs
+         * for x, y, z, with the result registers taken from the FINAL pair
+         * -- so the integer half is the last vmadh's signed clamp of the
+         * accumulator's 47:16 window, and the fraction half is the last
+         * vmadn's register, whose clamp tests the PARTIAL accumulator
+         * (before the final z*int term is added) and otherwise passes the
+         * raw low bits through. Identical chain in F3DEX2 2.04H and
+         * F3DZEX2 (trans, x, y, z order). Super Smash Bros.' attract
+         * letterbox geometry overflows the s15.16 clip range in y, where
+         * cxd4 stores 0x7fff:raw -- a plain cast wrapped to a large
+         * negative value and sent whole triangle fans down different clip
+         * paths. */
+        ox = read_s16_be(rdram, base + 0); /* x */
+        oy = read_s16_be(rdram, base + 2); /* y */
+        oz = read_s16_be(rdram, base + 4); /* z */
+
+        cx = (int64_t)ox * s->combined[0][0] + (int64_t)oy * s->combined[1][0]
+           + (int64_t)oz * s->combined[2][0] + (int64_t)s->combined[3][0];
+        cy = (int64_t)ox * s->combined[0][1] + (int64_t)oy * s->combined[1][1]
+           + (int64_t)oz * s->combined[2][1] + (int64_t)s->combined[3][1];
+        cz = (int64_t)ox * s->combined[0][2] + (int64_t)oy * s->combined[1][2]
+           + (int64_t)oz * s->combined[2][2] + (int64_t)s->combined[3][2];
+        cw = (int64_t)ox * s->combined[0][3] + (int64_t)oy * s->combined[1][3]
+           + (int64_t)oz * s->combined[2][3] + (int64_t)s->combined[3][3];
+
+        /* The fraction half of the stored clip value is the final vmadn's
+         * register, whose clamp tests the accumulator BEFORE the last
+         * vmadh's integer term. Which term that is depends on the
+         * microcode's MAC order: F3DEX2 accumulates trans, x, y, z (final
+         * integer term = z), while Turbo3D accumulates x, y, z, trans
+         * (gspTurbo3D text +0x4dc..+0x4f8; final integer term = the
+         * translation row). The two agree unless an intermediate sum
+         * overflows the s15.16 window -- Dark Rift's fight-scene bone
+         * matrices (rotations with |elements| > 1) overflow routinely,
+         * and modelling the wrong order left every character several
+         * pixels and shade steps away from the LLE reference. */
+        if (s->mvp_trans_last)
+        {
+            vt->cx = gsp_mvp_readback(cx, (int64_t)(s->combined[3][0] >> 16));
+            vt->cy = gsp_mvp_readback(cy, (int64_t)(s->combined[3][1] >> 16));
+            vt->cz = gsp_mvp_readback(cz, (int64_t)(s->combined[3][2] >> 16));
+            vt->cw = gsp_mvp_readback(cw, (int64_t)(s->combined[3][3] >> 16));
+        }
+        else
+        {
+            vt->cx = gsp_mvp_readback(cx,
+                         (int64_t)oz * (s->combined[2][0] >> 16));
+            vt->cy = gsp_mvp_readback(cy,
+                         (int64_t)oz * (s->combined[2][1] >> 16));
+            vt->cz = gsp_mvp_readback(cz,
+                         (int64_t)oz * (s->combined[2][2] >> 16));
+            vt->cw = gsp_mvp_readback(cw,
+                         (int64_t)oz * (s->combined[2][3] >> 16));
+        }
+
+        st_s = read_s16_be(rdram, base + 8);  /* s */
+        st_t = read_s16_be(rdram, base + 10); /* t */
+        /* Carry the raw S10.5 texel coordinate (modulated by the G_TEXTURE
+         * scale, an S0.16 fraction), NOT a [0,1]-normalized value. The
+         * angrylion edgewalker and texel pipeline consume S10.5 texel units
+         * directly; normalizing here (the GLideN64/GL-sampler convention)
+         * collapsed the sampled coordinate toward 0 and drove the texture
+         * combiner black. The encoder scales these into the fixed-point
+         * inverse-w envelope angrylion expects. */
+        /* The RSP texel coordinate is (raw S10.5 st * G_TEXTURE scale) >> 15:
+         * the S0.16 scale field reads 0x8000 as 1.0 (so gSPTexture(0xFFFF)
+         * roughly doubles). Calibrated against the cxd4 LLE oracle on the
+         * pause menu: draws with scale 0x8000 match raw st exactly, draws
+         * with scale 0xFFFF carry exactly twice the raw value; folding the
+         * scale at >> 16 (or not at all) halves the sampled texel for the
+         * 0xFFFF case. Result kept in s15.16:
+         * (st << 16) * scale >> 15 == (st * scale) << 1. */
+        /* (assigned below; G_TEXTURE_GEN overrides st_s/st_t first) */
+
+        if (s->geometry_mode & 0x00020000u)     /* G_LIGHTING */
+        {
+            /* [12..14] are a signed s8 normal, used RAW: the RSP does not
+             * transform or normalize vertex normals. Instead the light
+             * (and lookat) directions are lazily rotated into model space
+             * and normalized under the lightsValid cache, and the shade is
+             * shade = ambient + S max(0, 2 * (n . L_i)) * rgb_i >> 15,
+             * where n is the raw s8 normal and L_i the unit s8 model-space
+             * direction. The factor 2 is the VMULU accumulator doubling;
+             * for a full-length normal aligned with a light this reaches
+             * ~32258/32768 of the light colour. Authored sub-length
+             * normals dim exactly as on hardware, and non-orthonormal
+             * model matrices (squash/stretch animation) light correctly
+             * because the rotation is applied to the directions, not the
+             * normal. */
+            int nxb, nyb, nzb;
+            int li;
+            if (s->cbfd)
+            {
+                /* Conker's CBFD lighting differs from the stock directional
+                 * model: the per-vertex normal is not inline. nx,ny come from
+                 * a separate table (set by G_MOVEMEM/G_MV_NORMALES, indexed by
+                 * the vertex slot * 2) and nz is the low byte of the vertex
+                 * flag halfword (bytes 6..7). The base colour is the vertex's
+                 * own colour bytes (12..15), which the light then MULTIPLIES
+                 * rather than replaces: lit = clamp(ambient + light.rgb *
+                 * max(0, n . L)), shade = colour * lit. The light array holds
+                 * the directional lights in slots 0..num_lights-1 with the
+                 * ambient at slot num_lights, matching the /48-slot G_MV_LIGHT
+                 * and n*48 G_MW_NUMLIGHT the CBFD build uses. The dominant
+                 * (last) directional light plus the ambient carry the scene's
+                 * tone; CBFD's earlier lights are distance-attenuated point
+                 * lights whose per-vertex falloff is left to later work. */
+                unsigned int na = s->cbfd_nbase + ((unsigned int)idx << 1);
+                int cr = (int)read_u8_n64(rdram, base + 12);
+                int cg = (int)read_u8_n64(rdram, base + 13);
+                int cb = (int)read_u8_n64(rdram, base + 14);
+                int amb = s->num_lights;
+                int last = s->num_lights - 1;
+                int32_t nrm[3], litr, litg, litb, dot;
+                nxb = (int)(signed char)read_u8_n64(rdram, na + 0);
+                nyb = (int)(signed char)read_u8_n64(rdram, na + 1);
+                nzb = (int)(signed char)read_u8_n64(rdram, base + 6);
+                if (!s->lights_valid)
+                    gsp_light_dir_xfrm(s);
+                nrm[0] = nxb; nrm[1] = nyb; nrm[2] = nzb;
+                litr = s->light_rgb[amb][0] & 0xff;
+                litg = s->light_rgb[amb][1] & 0xff;
+                litb = s->light_rgb[amb][2] & 0xff;
+                if (last >= 0)
+                {
+                    dot = rsp_light_dirdot(nrm, s->light_dir[last]);
+                    litr += (int32_t)(((int64_t)(s->light_rgb[last][0] & 0xff)
+                                       * dot) >> 15);
+                    litg += (int32_t)(((int64_t)(s->light_rgb[last][1] & 0xff)
+                                       * dot) >> 15);
+                    litb += (int32_t)(((int64_t)(s->light_rgb[last][2] & 0xff)
+                                       * dot) >> 15);
+                }
+                /* Lights below the dominant one are point lights: intensity =
+                 * min(1, ca / len), len = 2 * |vPos - lpos|^2 in the position
+                 * domain, vPos the vertex pushed through the G_MW_COORD_MOD
+                 * offset (rows 8..10) and 16.16 scale (rows 12..14). With
+                 * G_LIGHTING_POSITIONAL set the intensity is also gated by the
+                 * normal dot so a light behind a face does not light it. These
+                 * fill in the illumination the dim ambient plus one directional
+                 * light would otherwise leave far too dark. */
+                for (li = last - 1; li >= 0; li--)
+                {
+                    int64_t vx, vy, vz, len, inten;
+                    vx = ((int64_t)ox + s->cbfd_cmod[8]) * s->cbfd_cmod[12];
+                    vy = ((int64_t)oy + s->cbfd_cmod[9]) * s->cbfd_cmod[13];
+                    vz = ((int64_t)oz + s->cbfd_cmod[10]) * s->cbfd_cmod[14];
+                    vx = (vx >> 16) - s->cbfd_lpos[li][0];
+                    vy = (vy >> 16) - s->cbfd_lpos[li][1];
+                    vz = (vz >> 16) - s->cbfd_lpos[li][2];
+                    len = (2 * (vx * vx + vy * vy + vz * vz)) >> 16;
+                    if (len <= 0)
+                        inten = 0x7fff;
+                    else
+                    {
+                        inten = ((int64_t)s->cbfd_lca[li] << 11) / len;
+                        if (inten > 0x7fff) inten = 0x7fff;
+                    }
+                    if ((s->geometry_mode & 0x00400000u) && inten > 0)
+                    {
+                        int32_t nd = rsp_light_dirdot(nrm, s->light_dir[li]);
+                        inten = (inten * nd) >> 15;
+                    }
+                    if (inten > 0)
+                    {
+                        litr += (int32_t)(((int64_t)(s->light_rgb[li][0] & 0xff)
+                                           * inten) >> 15);
+                        litg += (int32_t)(((int64_t)(s->light_rgb[li][1] & 0xff)
+                                           * inten) >> 15);
+                        litb += (int32_t)(((int64_t)(s->light_rgb[li][2] & 0xff)
+                                           * inten) >> 15);
+                    }
+                }
+                if (litr > 255) litr = 255;
+                if (litg > 255) litg = 255;
+                if (litb > 255) litb = 255;
+                vt->r = ((cr * litr) / 255) << 16;
+                vt->g = ((cg * litg) / 255) << 16;
+                vt->b = ((cb * litb) / 255) << 16;
+                vt->a = (int32_t)read_u8_n64(rdram, base + 15) << 16;
+            }
+            else
+            {
+            nxb = (int)(signed char)read_u8_n64(rdram, cofs + 0);
+            nyb = (int)(signed char)read_u8_n64(rdram, cofs + 1);
+            nzb = (int)(signed char)read_u8_n64(rdram, cofs + 2);
+            if (!s->lights_valid)
+                gsp_light_dir_xfrm(s);
+            if (!(s->geometry_mode & 0x00400000u))
+            {
+                /* Pure directional lighting (no G_LIGHTING_POSITIONAL):
+                 * the microcode's lights_dircoloraccum2 loop, bit-exact. */
+                int32_t nrm[3], out[3];
+                nrm[0] = nxb; nrm[1] = nyb; nrm[2] = nzb;
+                rsp_light_vtx(nrm, s->light_rgb[s->num_lights],
+                              (const int32_t (*)[3])s->light_rgb,
+                              (const int32_t (*)[3])s->light_dir,
+                              s->num_lights, out);
+                vt->r = out[0] << 16;
+                vt->g = out[1] << 16;
+                vt->b = out[2] << 16;
+                vt->a = (int32_t)read_u8_n64(rdram, cofs + 3) << 16;
+            }
+            else
+            {
+                /* Positional lighting (G_LIGHTING_POSITIONAL): the
+                 * microcode's positional loop walks the lights one per
+                 * iteration from the last down to the first, dispatching on
+                 * the light's kc byte: kc != 0 takes the light_point chain,
+                 * kc == 0 dots the prepass-normalized direction with the
+                 * unsigned vmulu/vmacu clamp. Either factor folds into the
+                 * running <<7-domain color with the per-light
+                 * vmulf(color, 0x7FFF) + vmacf round. */
+                int32_t lt[3], nrm[3], vtx3[3];
+                int32_t (*MV)[4] = s->modelview[s->modelview_top];
+                int32_t d;
+                nrm[0] = nxb; nrm[1] = nyb; nrm[2] = nzb;
+                vtx3[0] = ox; vtx3[1] = oy; vtx3[2] = oz;
+                lt[0] = (s->light_rgb[s->num_lights][0] & 0xff) << 7;
+                lt[1] = (s->light_rgb[s->num_lights][1] & 0xff) << 7;
+                lt[2] = (s->light_rgb[s->num_lights][2] & 0xff) << 7;
+                for (li = s->num_lights - 1; li >= 0; li--)
+                {
+                    if (s->light_kc[li] != 0)
+                    {
+                        d = rsp_light_point_factor((const int32_t (*)[4])MV,
+                                                   nrm, vtx3,
+                                                   s->light_pos[li],
+                                                   s->light_kc[li],
+                                                   s->light_kl[li],
+                                                   s->light_kq[li]);
+                        /* TEMP PTL counter */
+                    }
+                    else
+                        d = rsp_light_dirdot(nrm, s->light_dir[li]);
+                    rsp_light_fold1(lt, s->light_rgb[li], d);
+                    /* The loop suv-stores and luv-reloads the running
+                     * color through DMEM every iteration, so each fold's
+                     * result is truncated to its byte before the next
+                     * light folds in. */
+                    lt[0] = ((lt[0] >> 7) & 0xff) << 7;
+                    lt[1] = ((lt[1] >> 7) & 0xff) << 7;
+                    lt[2] = ((lt[2] >> 7) & 0xff) << 7;
+                }
+                vt->r = ((lt[0] >> 7) & 0xff) << 16;
+                vt->g = ((lt[1] >> 7) & 0xff) << 16;
+                vt->b = ((lt[2] >> 7) & 0xff) << 16;
+                vt->a = (int32_t)read_u8_n64(rdram, cofs + 3) << 16;
+            }
+            }
+
+            if ((s->geometry_mode & 0x00040000u) /* G_TEXTURE_GEN */
+                && !s->no_texgen)
+            {
+                /* lights_texgenmain: generated coordinates from the raw s8
+                 * normal against the two transformed lookat directions
+                 * (MOVEMEM light slots 0/1), through the exact vmulf/vmacf
+                 * accumulator chain; they replace the vertex-supplied lane
+                 * values ahead of the same texture-scale multiply. */
+                int linear = (s->geometry_mode & 0x00080000u) ? 1 : 0;
+                int32_t nrm[3], gs, gt;
+                nrm[0] = nxb; nrm[1] = nyb; nrm[2] = nzb;
+                rsp_texgen(nrm, s->lookat[0], s->lookat[1], linear, &gs, &gt);
+                st_s = gs;
+                st_t = gt;
+            }
+            else if (s->no_texgen && s->reflect_valid
+                     && (s->geometry_mode & 0x00040000u))
+            {
+                /* F3DFLX reflection: the same lookat dot product the standard
+                 * texgen would turn into a texture coordinate is instead used
+                 * as an index into the 1D ramp DMA'd to DMEM, and the fetched
+                 * value becomes the vertex fog factor (carried in alpha). The
+                 * vertex-supplied S/T are left untouched for the body decal.
+                 * gSPLookAtY drives the effect, so the lookat-Y coordinate
+                 * (gt) is the index; the ramp is 256 entries, so the S10.5
+                 * coordinate's whole-texel field (>> 7 of the [0,0x7fff]
+                 * texgen output) selects the entry. */
+                int32_t nrm[3], gs, gt;
+                unsigned int ri;
+                nrm[0] = nxb; nrm[1] = nyb; nrm[2] = nzb;
+                rsp_texgen(nrm, s->lookat[0], s->lookat[1], 0, &gs, &gt);
+                /* The slot-0 (alpha light) dot is the reflection coordinate.
+                 * gs is 0x4000 + 0x4000*dot, so gs >> 7 is 128 + 128*dot,
+                 * the signed ramp index the F3DFLX routine looks up. */
+                ri = ((unsigned int)gs >> 7) & 0xffu;
+                refl_a = (int32_t)s->reflect_lut[ri] << 16;
+                has_refl = 1;
+            }
+        }
+        else if (s->acclaim && (s->geometry_mode & 0x00000080u)
+                 && s->acclaim_nlights > 0)
+        {
+            /* Acclaim custom lighting: G_LIGHTING is off, the geometry-mode
+             * bit 0x80 selects the custom L1-distance point-light flood. The
+             * light positions are eye-space (the RSP compares them against the
+             * vertex after the modelview*view transform), so use the combined
+             * transform's eye-space position (cx,cy,cz >> 16), which the RSP's
+             * lighting reads bit-for-bit. Start from the vertex's own colour
+             * bytes and add each light. */
+            int32_t r8 = (int32_t)read_u8_n64(rdram, cofs + 0);
+            int32_t g8 = (int32_t)read_u8_n64(rdram, cofs + 1);
+            int32_t b8 = (int32_t)read_u8_n64(rdram, cofs + 2);
+            acclaim_light(s, (int32_t)(cx >> 16), (int32_t)(cy >> 16),
+                          (int32_t)(cz >> 16), &r8, &g8, &b8);
+            vt->r = r8 << 16;
+            vt->g = g8 << 16;
+            vt->b = b8 << 16;
+            vt->a = (int32_t)read_u8_n64(rdram, cofs + 3) << 16;
+        }
+        else
+        {
+            vt->r = (int32_t)read_u8_n64(rdram, cofs + 0) << 16;
+            vt->g = (int32_t)read_u8_n64(rdram, cofs + 1) << 16;
+            vt->b = (int32_t)read_u8_n64(rdram, cofs + 2) << 16;
+            vt->a = (int32_t)read_u8_n64(rdram, cofs + 3) << 16;
+        }
+
+        vt->s = (int32_t)(((int64_t)st_s * (int64_t)s->tex_scale_s) << 1);
+        vt->t = (int32_t)(((int64_t)st_t * (int64_t)s->tex_scale_t) << 1);
+        vt->sv = (int16_t)(((int64_t)st_s * (int64_t)s->tex_scale_s) >> 16);
+        vt->tv = (int16_t)(((int64_t)st_t * (int64_t)s->tex_scale_t) >> 16);
+
+        if ((s->geometry_mode & 0x00010000u) && !s->fog_off)   /* G_FOG */
+        {
+            /* With fog enabled the RSP replaces the shade alpha with the fog
+             * factor: alpha = clamp(ndc_z * fog_m + fog_o, 0, 255), where
+             * fog_m/fog_o come from the G_MW_FOG moveword (gSPFogPosition).
+             * Verified against the cxd4 LLE oracle: indoors every actor
+             * triangle carries shade alpha 0 (no fog at any visible depth);
+             * passing the vertex alpha (255) through instead makes the
+             * G_RM_FOG_SHADE_A blender output pure fog colour, which is what
+             * rendered every lit actor as a black silhouette. ndc_z is the
+             * exact s15.16 z/w; for w <= 0 the vertex is headed for the
+             * clipper and the factor is irrelevant, so 0 is used. */
+            int32_t fa = 0;
+            if (vt->cw > 0)
+            {
+                /* RSP-exact fog: the microcode's vertex chain, so the
+                 * triangle write's alpha lane is bit-identical to the LLE
+                 * RSP. */
+                fa = rsp_vtx_fog(vt->cz, vt->cw,
+                                 (int32_t)(s->persp_norm ? s->persp_norm : 0xffffu),
+                                 s->fog_m, s->fog_o);
+            }
+            vt->a = fa << 16;
+        }
+
+        /* F3DFLX's "reflection" is this fog factor, computed from the lookat
+         * ramp above instead of from screen Z. It overrides whatever alpha the
+         * lighting/fog path produced so the blender mixes the racer fog colour
+         * by the reflection amount (mostly zero -> body colour, peaks -> shiny
+         * highlight). */
+        if (has_refl)
+            vt->a = refl_a;
+
+        /* Store the RSP's per-vertex clip outcode (the VCH sign-aware
+         * screen-plane compare, bits N/P per x, y, z axis -- the SCRN half
+         * of VTX_CLIP). G_CULLDL and the triangle trivial reject test the
+         * AND of these flags, and unlike a plain w > 0 frustum test the
+         * VCH rule also flags vertices behind the eye, which is what lets
+         * the RSP reject the near geometry slivers a guard-band clipper
+         * would otherwise rasterize. */
+        gsp_clip_vertex_flags(s, vt);
+        gsp_vertex_screen(s, vt);
+        /* A transformed vertex is drawn by the full triangle writer; only
+         * the Fighting Force 64 2D overlay injects the raw-attribute kind,
+         * and a G_VTX into its slot ends that. */
+        vt->flat2d = 0;
+    }
+}
+
+#define GEOM_ZBUFFER    0x00000001u
+
+/* T3DUX (Turbo3D UX, Last Legion UX / Toukon Road) vertex load. The
+ * reference declares the vertex as {s16 y; s16 x; u16 flag; s16 z} and the
+ * colour as {u8 a,b,g,r} -- but those declarations are raw overlays on the
+ * host's byteswapped RDRAM, so the RSP's logical big-endian layout is the
+ * in-word mirror: s16 x at +0, y at +2, z at +4, flag at +6, and colour
+ * bytes r,g,b,a at +0..+3. (Read at the declaration offsets with logical
+ * accessors, x/y came out transposed and z landed on the flag halfword --
+ * always zero -- which flattened every object and dropped the 3D geometry.)
+ * Positions run through the same combined-matrix transform and screen
+ * snapshot as gsp_vertex; T3DUX clears G_LIGHTING for the object draw, so
+ * the colour is always the vertex-supplied value (never lit). Texel
+ * coordinates come from the triangle's separate texcoord indices, applied
+ * later by gsp_set_vertex_st, so they load as zero here. */
+void gsp_vertex_t3dux(GSPState *s, const unsigned char *rdram,
+                      unsigned int vaddr, unsigned int caddr, int n)
+{
+    int i;
+    if (!s->combined_valid)
+        gsp_combine_matrices(s);
+
+    for (i = 0; i < n; i++)
+    {
+        unsigned int vbase = vaddr + (unsigned int)i * 8u;
+        unsigned int cbase = caddr + (unsigned int)i * 4u;
+        int idx = i;
+        int32_t ox, oy, oz;
+        int64_t cx, cy, cz, cw;
+        GSPVertex *vt;
+        if (idx < 0 || idx >= GSP_MAX_VERTICES)
+            break;
+        vt = &s->vtx[idx];
+
+        ox = read_s16_be(rdram, vbase + 0);
+        oy = read_s16_be(rdram, vbase + 2);
+        oz = read_s16_be(rdram, vbase + 4);
+
+        cx = (int64_t)ox * s->combined[0][0] + (int64_t)oy * s->combined[1][0]
+           + (int64_t)oz * s->combined[2][0] + (int64_t)s->combined[3][0];
+        cy = (int64_t)ox * s->combined[0][1] + (int64_t)oy * s->combined[1][1]
+           + (int64_t)oz * s->combined[2][1] + (int64_t)s->combined[3][1];
+        cz = (int64_t)ox * s->combined[0][2] + (int64_t)oy * s->combined[1][2]
+           + (int64_t)oz * s->combined[2][2] + (int64_t)s->combined[3][2];
+        cw = (int64_t)ox * s->combined[0][3] + (int64_t)oy * s->combined[1][3]
+           + (int64_t)oz * s->combined[2][3] + (int64_t)s->combined[3][3];
+
+        vt->cx = gsp_mvp_readback(cx, (int64_t)oz * (s->combined[2][0] >> 16));
+        vt->cy = gsp_mvp_readback(cy, (int64_t)oz * (s->combined[2][1] >> 16));
+        vt->cz = gsp_mvp_readback(cz, (int64_t)oz * (s->combined[2][2] >> 16));
+        vt->cw = gsp_mvp_readback(cw, (int64_t)oz * (s->combined[2][3] >> 16));
+
+        /* Logical colour bytes are r,g,b,a at +0..+3 (the reference's
+         * a,b,g,r declaration mirrored by the overlay swap). */
+        vt->r = (int32_t)read_u8_n64(rdram, cbase + 0) << 16;
+        vt->g = (int32_t)read_u8_n64(rdram, cbase + 1) << 16;
+        vt->b = (int32_t)read_u8_n64(rdram, cbase + 2) << 16;
+        vt->a = (int32_t)read_u8_n64(rdram, cbase + 3) << 16;
+
+        vt->s = 0;
+        vt->t = 0;
+        vt->sv = 0;
+        vt->tv = 0;
+        vt->flat2d = 0;
+
+        gsp_clip_vertex_flags(s, vt);
+        gsp_vertex_screen(s, vt);
+    }
+}
+
+/* DKR: patch a cached vertex's texel coordinate from a gSPPolygon entry. The
+ * DKRTriangle carries per-vertex S10.5 S/T; apply the same tex-scale fold the
+ * normal vertex load uses so the edgewalker sees consistent texel units. */
+/* Override a cached vertex's colour (T3DUX flat shading applies the same
+ * a,b,g,r to all three vertices of a face before the triangle is emitted). */
+void gsp_set_vertex_rgba(GSPState *s, int idx, int r, int g, int b, int a)
+{
+    GSPVertex *vt;
+    if (idx < 0 || idx >= GSP_MAX_VERTICES)
+        return;
+    vt = &s->vtx[idx];
+    vt->r = (int32_t)(r & 0xff) << 16;
+    vt->g = (int32_t)(g & 0xff) << 16;
+    vt->b = (int32_t)(b & 0xff) << 16;
+    vt->a = (int32_t)(a & 0xff) << 16;
+}
+
+void gsp_set_vertex_st(GSPState *s, int idx, int st_s, int st_t)
+{    GSPVertex *vt;
+    if (idx < 0 || idx >= GSP_MAX_VERTICES)
+        return;
+    vt = &s->vtx[idx];
+    if (!s->viewport.rsp_screen_model)
+    {
+        /* F3DDKR: raw S10.5, no G_TEXTURE scale. Store the shorts exactly
+         * and the wide field at << 16 -- representable for the whole s16
+         * range, unlike the pipeline's << 17 form, which wraps int32 for
+         * |st| >= 16384 (Ancient Lake's canyon walls reach +-18545 and
+         * the wrapped values solved into garbage S/T planes -- the
+         * sawtooth texture banding). The emitter's DKR wide-double flag
+         * restores the << 17 magnitude inside its 64-bit plane product. */
+        vt->s  = (int32_t)st_s << 16;
+        vt->t  = (int32_t)st_t << 16;
+        vt->sv = (int16_t)st_s;
+        vt->tv = (int16_t)st_t;
+        return;
+    }
+    if (s->viewport.rs_model)
+    {
+        /* Rogue Squadron: the caller hands the already-scaled texel short
+         * (the mid slice of st * the opcode 3/0x82 s15.16 scale); store it
+         * as the RSP does and double into the wide field. */
+        vt->sv = (int16_t)st_s;
+        vt->tv = (int16_t)st_t;
+        vt->s  = (int32_t)((uint32_t)(int32_t)st_s << 17);
+        vt->t  = (int32_t)((uint32_t)(int32_t)st_t << 17);
+        return;
+    }
+    vt->s  = (int32_t)(((int64_t)st_s * (int64_t)s->tex_scale_s) << 1);
+    vt->t  = (int32_t)(((int64_t)st_t * (int64_t)s->tex_scale_t) << 1);
+    vt->sv = (int16_t)(((int64_t)st_s * (int64_t)s->tex_scale_s) >> 16);
+    vt->tv = (int16_t)(((int64_t)st_t * (int64_t)s->tex_scale_t) >> 16);
+}
+
+/* DKR (F3DDKR) vertex load. The DKR microcode uses a compact 10-byte vertex
+ * format -- position (s16 x,y,z) + RGBA (u8 each), no texture coordinate and
+ * no normal -- unlike the 16-byte F3DEX Vtx that gsp_vertex reads. Layout
+ * (verified against the retail F3DDKR xbus microcode and GLideN64's
+ * gSPLoadDMAVertexData):
+ *     +0 s16 x   +2 s16 y   +4 s16 z   +6 u8 r  +7 u8 g  +8 u8 b  +9 u8 a
+ * Transform/clip/screen are identical to gsp_vertex; only the read differs.
+ * Colour is the vertex RGBA directly (DKR's geometry is vertex-coloured, not
+ * lit through the F3DEX lighting path). Texture coordinates are zero here; the
+ * gSPPolygon tex-enable + the active tile drive texturing at draw time. */
+void gsp_vertex_dkr(GSPState *s, const unsigned char *rdram, unsigned int addr,
+                    int n, int v0, int billboard)
+{
+    int i;
+    if (!s->combined_valid)
+        gsp_combine_matrices(s);
+
+    for (i = 0; i < n; i++)
+    {
+        unsigned int base = addr + (unsigned int)i * 10u;
+        int idx = v0 + i;
+        int32_t ox, oy, oz;
+        int64_t cx, cy, cz, cw;
+        GSPVertex *vt;
+        if (idx < 0 || idx >= GSP_MAX_VERTICES)
+            continue;
+        vt = &s->vtx[idx];
+
+        ox = read_s16_be(rdram, base + 0);
+        oy = read_s16_be(rdram, base + 2);
+        oz = read_s16_be(rdram, base + 4);
+
+        cx = (int64_t)ox * s->combined[0][0] + (int64_t)oy * s->combined[1][0]
+           + (int64_t)oz * s->combined[2][0] + (int64_t)s->combined[3][0];
+        cy = (int64_t)ox * s->combined[0][1] + (int64_t)oy * s->combined[1][1]
+           + (int64_t)oz * s->combined[2][1] + (int64_t)s->combined[3][1];
+        cz = (int64_t)ox * s->combined[0][2] + (int64_t)oy * s->combined[1][2]
+           + (int64_t)oz * s->combined[2][2] + (int64_t)s->combined[3][2];
+        cw = (int64_t)ox * s->combined[0][3] + (int64_t)oy * s->combined[1][3]
+           + (int64_t)oz * s->combined[2][3] + (int64_t)s->combined[3][3];
+
+        vt->cx = gsp_mvp_readback(cx, (int64_t)oz * (s->combined[2][0] >> 16));
+        vt->cy = gsp_mvp_readback(cy, (int64_t)oz * (s->combined[2][1] >> 16));
+        vt->cz = gsp_mvp_readback(cz, (int64_t)oz * (s->combined[2][2] >> 16));
+        vt->cw = gsp_mvp_readback(cw, (int64_t)oz * (s->combined[2][3] >> 16));
+
+        /* Billboarding (gSPVertexDKR with billboard enabled): vertices loaded
+         * at idx >= 1 are camera-facing offsets relative to the anchor at
+         * vertex 0.  The microcode adds vertex 0's transformed clip position
+         * onto each (GLideN64 gSPBillboardVertex: vtx += vtx0).  Without this
+         * the offset vertices land at raw clip-space and the sprite collapses
+         * to a degenerate / off-screen quad (the DKR intro Diddy/palms blob). */
+        if (billboard && idx >= 1)
+        {
+            const GSPVertex *a = &s->vtx[0];
+            vt->cx += a->cx;
+            vt->cy += a->cy;
+            vt->cz += a->cz;
+            vt->cw += a->cw;
+        }
+
+        vt->r = (int32_t)read_u8_n64(rdram, base + 6) << 16;
+        vt->g = (int32_t)read_u8_n64(rdram, base + 7) << 16;
+        vt->b = (int32_t)read_u8_n64(rdram, base + 8) << 16;
+        /* Shade alpha. With G_FOG set in the geometry mode the microcode
+         * replaces it with the computed per-vertex fog factor from the
+         * G_MW_FOG coefficients, exactly like the stock F3D family -- Jet
+         * Force Gemini's in-game world runs G_FOG with live coefficients
+         * and the cxd4 LLE stream carries a full spread of fog alphas
+         * (90 distinct values on the Goldwood landing frame); forcing the
+         * fogged-rendermode zero there killed the distance haze and the
+         * whole scene rendered overbright. Diddy Kong Racing's frames are
+         * unaffected either way: its fog coefficients clamp the factor to
+         * zero at every visible depth, which is what the earlier
+         * "RSP zeroes shade alpha under the fogged world blend" finding
+         * was actually observing.
+         *
+         * Without G_FOG the DKR rule stands: the rendermode-gated zero
+         * (dkr_shade_alpha_zero, fed by both raw 0xEF and partial
+         * othermode writes) under the fogged world blend, the raw vertex
+         * alpha byte under the actor blend (the alpha-shaded Taj genie). */
+        if ((s->geometry_mode & 0x00010000u) && !s->fog_off)   /* G_FOG */
+        {
+            int32_t fa = 0;
+            if (vt->cw > 0)
+                fa = rsp_vtx_fog_dkr(vt->cz, vt->cw, s->fog_m, s->fog_o);
+            vt->a = fa << 16;
+        }
+        else
+            vt->a = s->dkr_shade_alpha_zero
+                  ? 0
+                  : ((int32_t)read_u8_n64(rdram, base + 9) << 16);
+
+        vt->s = 0;
+        vt->t = 0;
+        vt->sv = 0;
+        vt->tv = 0;
+        vt->flat2d = 0;
+
+        gsp_clip_vertex_flags(s, vt);
+        gsp_vertex_screen(s, vt);
+    }
+}
+
+void gsp_set_tri_scales(GSPState *s, int32_t dx_scale, int32_t idy_scale,
+                        int32_t frac_mask, int32_t vcr_bound)
+{
+    if (dx_scale > 0 && idy_scale > 0)
+    {
+        s->tri_dx_scale = dx_scale;
+        s->tri_idy_scale = idy_scale;
+        s->tri_frac_mask = frac_mask & 0xffff;
+        if (vcr_bound > 0)
+            s->tri_vcr_bound = vcr_bound;
+        s->viewport.tri_dx_scale = dx_scale;
+        s->viewport.tri_idy_scale = idy_scale;
+        s->viewport.tri_frac_mask = s->tri_frac_mask;
+        s->viewport.tri_vcr_bound = s->tri_vcr_bound;
+    }
+}
+
+void gsp_set_persp_norm(GSPState *s, unsigned int pn)
+{
+    s->persp_norm = pn & 0xffffu;
+    s->viewport.persp_norm = pn & 0xffffu;
+}
+
+void gsp_set_geometry_mode(GSPState *s, unsigned int mode)
+{
+    s->geometry_mode = mode;
+}
+
+unsigned int gsp_get_geometry_mode(const GSPState *s)
+{
+    return s->geometry_mode;
+}
+
+void gsp_set_num_lights(GSPState *s, int n)
+{
+    if (n < 0) n = 0;
+    if (n > GSP_MAX_LIGHTS - 1) n = GSP_MAX_LIGHTS - 1;
+    s->num_lights = n;
+    /* The RSP zeroes lightsValid whenever numLightsx18 is written. */
+    s->lights_valid = 0;
+}
+
+void gsp_set_light(GSPState *s, const unsigned char *rdram,
+                   unsigned int addr, int index)
+{
+    if (index < 0 || index >= GSP_MAX_LIGHTS)
+        return;
+
+    /* Light struct: bytes [0..2] = r,g,b (0..255); the direction is a signed
+     * s8 vector at bytes [8..10]. The raw direction is cached as loaded; the
+     * RSP transforms all directions into model space (modelview transpose)
+     * and normalizes them lazily at vertex-processing time, gated by
+     * lightsValid -- see gsp_light_dir_xfrm(). */
+    s->light_rgb[index][0] = (int32_t)read_u8_n64(rdram, addr + 0);
+    s->light_rgb[index][1] = (int32_t)read_u8_n64(rdram, addr + 1);
+    s->light_rgb[index][2] = (int32_t)read_u8_n64(rdram, addr + 2);
+
+    s->light_raw[index][0] = (int)(signed char)read_u8_n64(rdram, addr + 8);
+    s->light_raw[index][1] = (int)(signed char)read_u8_n64(rdram, addr + 9);
+    s->light_raw[index][2] = (int)(signed char)read_u8_n64(rdram, addr + 10);
+
+    /* F3DZEX point light fields. A nonzero byte at +3 (constant attenuation
+     * kc) marks the light as positional: the struct then carries an s16
+     * camera-space position at +8 (overlapping the s8 direction of the
+     * directional layout), a linear factor kl at +7 and a quadratic factor
+     * kq at +14. kc == 0 keeps the plain directional interpretation. */
+    s->light_kc[index] = (int32_t)read_u8_n64(rdram, addr + 3);
+    s->light_kl[index] = (int32_t)read_u8_n64(rdram, addr + 7);
+    s->light_kq[index] = (int32_t)read_u8_n64(rdram, addr + 14);
+    s->light_pos[index][0] = (int32_t)(short)((read_u8_n64(rdram, addr + 8) << 8)
+                                             | read_u8_n64(rdram, addr + 9));
+    s->light_pos[index][1] = (int32_t)(short)((read_u8_n64(rdram, addr + 10) << 8)
+                                             | read_u8_n64(rdram, addr + 11));
+    s->light_pos[index][2] = (int32_t)(short)((read_u8_n64(rdram, addr + 12) << 8)
+                                             | read_u8_n64(rdram, addr + 13));
+    /* CBFD point-light fields: an s16 position at bytes 32..36 (distinct from
+     * the s8 direction at 8..10 the dominant light dots against) and an
+     * attenuation numerator at byte 12 (the microcode's ca is byte / 16; kept
+     * raw here = ca * 16 and unscaled at the point-light fold). */
+    s->cbfd_lpos[index][0] = (int32_t)(short)((read_u8_n64(rdram, addr + 32) << 8)
+                                             | read_u8_n64(rdram, addr + 33));
+    s->cbfd_lpos[index][1] = (int32_t)(short)((read_u8_n64(rdram, addr + 34) << 8)
+                                             | read_u8_n64(rdram, addr + 35));
+    s->cbfd_lpos[index][2] = (int32_t)(short)((read_u8_n64(rdram, addr + 36) << 8)
+                                             | read_u8_n64(rdram, addr + 37));
+    s->cbfd_lca[index] = (int32_t)read_u8_n64(rdram, addr + 12);
+    /* G_MOVEMEM does not touch lightsValid (see gsp_set_lookat). */
+}
+
+/* G_MODIFYVTX: patch one field of an already-transformed vertex in the
+ * buffer. The ST write (where == 0x14) carries texture coordinates the
+ * game has already multiplied by the G_TEXTURE scale, exactly the 16-bit
+ * value the RSP vertex buffer keeps, so it bypasses the vertex loader's
+ * scale fold; the stored s15.16 form is that value shifted up. The RGBA
+ * write replaces the shade color bytes. Screen-coordinate overrides
+ * (0x18/0x1c) are not modeled: the clip-space position they would
+ * desynchronize from feeds the clipper, and no validated content uses
+ * them yet. */
+void gsp_modify_vertex(GSPState *s, int vtx, unsigned int where,
+                       unsigned int w1)
+{
+    GSPVertex *vt;
+    if (vtx < 0 || vtx >= GSP_MAX_VERTICES)
+        return;
+    vt = &s->vtx[vtx];
+    if (where == 0x14u)         /* G_MWO_POINT_ST */
+    {
+        vt->s = (int32_t)(int16_t)((w1 >> 16) & 0xffffu) << 16;
+        vt->t = (int32_t)(int16_t)(w1 & 0xffffu) << 16;
+        vt->sv = (int16_t)((w1 >> 16) & 0xffffu);
+        vt->tv = (int16_t)(w1 & 0xffffu);
+    }
+    else if (where == 0x10u)    /* G_MWO_POINT_RGBA */
+    {
+        vt->r = (int32_t)((w1 >> 24) & 0xffu) << 16;
+        vt->g = (int32_t)((w1 >> 16) & 0xffu) << 16;
+        vt->b = (int32_t)((w1 >> 8) & 0xffu) << 16;
+        vt->a = (int32_t)(w1 & 0xffu) << 16;
+    }
+    else if (where == 0x18u)    /* G_MWO_POINT_XYSCREEN */
+    {
+        /* The microcode stores the two s10.2 halves straight into the
+         * vertex record's screen x/y (+0x18/+0x1a); the rest of the
+         * record (z, 1/w, clip flags) is untouched, so the patched
+         * vertex keeps its original depth and reject behavior. This
+         * pipeline carries screen coordinates as s10.2 << 14 (the
+         * bridge reads them back with >> 14), so scale the raw halves
+         * accordingly -- storing them unscaled collapsed every patched
+         * vertex to (0, 0) and the triangles to zero-area rejects (The
+         * New Tetris draws its tetromino sprites as zero-position
+         * quads positioned entirely through gSPModifyVertex). */
+        vt->scr_x = (int32_t)((int16_t)((w1 >> 16) & 0xffffu)) << 14;
+        vt->scr_y = (int32_t)((int16_t)(w1 & 0xffffu)) << 14;
+    }
+    else if (where == 0x1cu)    /* G_MWO_POINT_ZSCREEN */
+    {
+        /* 32-bit screen-z word (int<<16 | frac) at +0x1c. */
+        vt->scr_z = (int32_t)w1;
+    }
+}
+
+void gsp_set_light_color(GSPState *s, int index,
+                         int32_t rr, int32_t gg, int32_t bb)
+{
+    if (index < 0 || index >= GSP_MAX_LIGHTS)
+        return;
+    s->light_rgb[index][0] = rr;
+    s->light_rgb[index][1] = gg;
+    s->light_rgb[index][2] = bb;
+    /* direction (and the lightsValid transform cache) intentionally
+     * untouched: gSPLightColor documents itself as a color-only update */
+}
+
+/* Guard-band plane distance for clip-space vertex v (s15.16) against plane p:
+ * p0: 2w - x >= 0   (x <=  2w)
+ * p1: 2w + x >= 0   (x >= -2w)
+ * p2: 2w - y >= 0   (y <=  2w)
+ * p3: 2w + y >= 0   (y >= -2w)
+ * The clip ratio of 2 matches the RSP guard band measured from the cxd4 LLE
+ * stream (clipped skybox vertices land exactly on screen = vtrans +- 2*vscale).
+ * The four side planes jointly bound w > 0, so Sutherland-Hodgman against
+ * them alone also disposes of behind-the-eye (w <= 0) vertices, which is the
+ * NoN ("no near clip") microcode behaviour. Evaluated in 64-bit: |2w| + |x|
+ * can exceed 31 bits. */
+/* The microcode's polygon clipper (ovl3). Conditions run in the order
+ * near, far, +y, +x, -y, -x; each pass walks the polygon edges starting
+ * from the last vertex and subdivides edges whose endpoints differ in the
+ * condition's outcode bit, producing the boundary vertex with the
+ * RSP-exact rsp_clip_lerp. The new vertex's outcodes are recomputed from
+ * the lerped clip-space position with the same VCH rules the vertex
+ * pipeline uses, since later conditions test them. Attribute lanes are
+ * lerped in the stored domains: colors as byte << 7, texture coordinates
+ * as the raw S10.5 shorts. */
+
+static const int16_t gsp_clip_ratio_rows[6][4] = {
+    { 0, 0, 0,  1 },   /* near (NoN: w; z lane patched from clip_near_z) */
+    { 0, 0, 1, -1 },   /* far  (z - w)         */
+    { 0, 1, 0, -2 },   /* +y (w lane = -clip_ratio, patched at use) */
+    { 1, 0, 0, -2 },   /* +x                   */
+    { 0, 1, 0,  2 },   /* -y (w lane = +clip_ratio, patched at use) */
+    { 1, 0, 0,  2 }    /* -x                   */
+};
+
+static const unsigned int gsp_clip_cond_mask[6] = {
+    1u << 7,            /* CLIP_NEAR = CLIP_NW << SCRN (NoN) */
+    1u << 14,           /* CLIP_FAR  = CLIP_PZ << SCRN       */
+    1u << 29,           /* CLIP_PY << SCAL                   */
+    1u << 28,           /* CLIP_PX << SCAL                   */
+    1u << 21,           /* CLIP_NY << SCAL                   */
+    1u << 20            /* CLIP_NX << SCAL                   */
+};
+
+/* One lane of the microcode's VCH/VCL outcode compare on (int:frac)
+ * pairs, exact to the hardware's boundary rules: opposite signs use the
+ * int sum, deferring to the fraction sum when the ints land on -1 (a
+ * carry up to and including 0x10000 keeps the le bit) or exactly 0
+ * (only a zero or exactly-1.0 fraction sum does); same signs use the
+ * int difference, deferring to an unsigned fraction compare on equal
+ * ints. Validated bit-exact against 35k stored flag words and the raw
+ * compare captures of both VCH rounds. */
+static void gsp_vch_vcl_lane(int32_t vsi, int32_t vsf,
+                             int32_t vti, int32_t vtf, int *le, int *ge)
+{
+    int32_t a = (int32_t)(int16_t)vsi;
+    int32_t b = (int32_t)(int16_t)vti;
+    if ((a ^ b) < 0)
+    {
+        int32_t sum = a + b;
+        *ge = (b < 0);
+        if (sum == -1)
+            *le = (vsf + vtf) <= 0x10000;
+        else if (sum == 0)
+            *le = ((vsf + vtf) == 0) || ((vsf + vtf) == 0x10000);
+        else
+            *le = (sum < 0);
+    }
+    else
+    {
+        int32_t d = a - b;
+        *le = (b < 0);
+        if (d == 0)
+            *ge = (vsf >= vtf);
+        else
+            *ge = (d > 0);
+    }
+}
+
+/* Recompute the stored VCH/VCL outcodes for a vertex: the screen-space
+ * word compares each lane against w, and the guard word compares
+ * against the clip-ratio-scaled w with the w lane's fraction replaced
+ * by the z fraction (the microcode reloads it before the second
+ * compare, turning that lane into the fraction-level far test). */
+static void gsp_clip_vertex_flags(const GSPState *st, GSPVertex *vt)
+{
+    int32_t ci[4], cf[4];
+    int ax, le, ge;
+    unsigned int fl = 0;
+    int32_t w2;
+    ci[0] = (vt->cx >> 16) & 0xffff; cf[0] = vt->cx & 0xffff;
+    ci[1] = (vt->cy >> 16) & 0xffff; cf[1] = vt->cy & 0xffff;
+    ci[2] = (vt->cz >> 16) & 0xffff; cf[2] = vt->cz & 0xffff;
+    ci[3] = (vt->cw >> 16) & 0xffff; cf[3] = vt->cw & 0xffff;
+    for (ax = 0; ax < 4; ax++)
+    {
+        gsp_vch_vcl_lane(ci[ax], cf[ax], ci[3], cf[3], &le, &ge);
+        if (le) fl |= 1u << (4 + ax);
+        if (ge) fl |= 1u << (12 + ax);
+    }
+    w2 = rsp_clip_scale_w(vt->cw, st->clip_ratio);
+    for (ax = 0; ax < 4; ax++)
+    {
+        int32_t vsf = (ax == 3) ? cf[2] : cf[ax];
+        gsp_vch_vcl_lane(ci[ax], vsf, (w2 >> 16) & 0xffff, w2 & 0xffff,
+                         &le, &ge);
+        if (le) fl |= 1u << (20 + ax);
+        if (ge) fl |= 1u << (28 + ax);
+    }
+    if (st->clip_no_far)
+        fl &= ~((1u << 14) | (1u << 30));
+    vt->clip = (int)fl;
+}
+
+static void gsp_clip_subdivide(GSPState *st, GSPVertex *out,
+                               const GSPVertex *onv,
+                               const GSPVertex *offv, const int16_t cr[4])
+{
+    int32_t on_pos[4], off_pos[4], out_pos[4];
+    int16_t on_attr[8], off_attr[8], out_attr[8];
+    on_pos[0] = onv->cx;  on_pos[1] = onv->cy;
+    on_pos[2] = onv->cz;  on_pos[3] = onv->cw;
+    off_pos[0] = offv->cx; off_pos[1] = offv->cy;
+    off_pos[2] = offv->cz; off_pos[3] = offv->cw;
+    /* The intersection vertex is built in the clipper's scratch list, so
+     * every field the triangle writer reads is written here. The
+     * raw-attribute (2D overlay) kind survives only along an edge whose
+     * both ends are that kind. */
+    out->flat2d = (onv->flat2d && offv->flat2d) ? 1 : 0;
+    if (st->rs_clip_model)
+    {
+        /* Rogue Squadron's clip overlay (live IMEM 0x1ed0..0x1fb8): the
+         * intersection weights come from the transcribed divide chain in
+         * rsp_clip_weights_rs, the position is the 32-bit
+         * vmudl/vmadm+vmadl/vmadm blend of the clip-space pairs, and the
+         * colours and VTX_TC shorts are the vmudm mid-read blend of the
+         * luv << 7 byte lanes and raw stored shorts. The new record then
+         * runs the normal vertex transform (screen, inverse-w, fog z),
+         * exactly as the overlay's jal to the shared record transform. */
+        int32_t in4[4], out4[4], wc, wt;
+        int cch;
+        int32_t cb_on[4], cb_off[4];
+        in4[0] = onv->cx;  in4[1] = onv->cy;
+        in4[2] = onv->cz;  in4[3] = onv->cw;
+        out4[0] = offv->cx; out4[1] = offv->cy;
+        out4[2] = offv->cz; out4[3] = offv->cw;
+        rsp_clip_weights_rs(in4, out4, cr, &wc, &wt);
+        out->cx = rsp_clip_blend32_rs(onv->cx, offv->cx, wc, wt);
+        out->cy = rsp_clip_blend32_rs(onv->cy, offv->cy, wc, wt);
+        out->cz = rsp_clip_blend32_rs(onv->cz, offv->cz, wc, wt);
+        out->cw = rsp_clip_blend32_rs(onv->cw, offv->cw, wc, wt);
+        cb_on[0] = (int32_t)(((onv->r >> 16) & 0xff) << 7);
+        cb_on[1] = (int32_t)(((onv->g >> 16) & 0xff) << 7);
+        cb_on[2] = (int32_t)(((onv->b >> 16) & 0xff) << 7);
+        cb_on[3] = (int32_t)(((onv->a >> 16) & 0xff) << 7);
+        cb_off[0] = (int32_t)(((offv->r >> 16) & 0xff) << 7);
+        cb_off[1] = (int32_t)(((offv->g >> 16) & 0xff) << 7);
+        cb_off[2] = (int32_t)(((offv->b >> 16) & 0xff) << 7);
+        cb_off[3] = (int32_t)(((offv->a >> 16) & 0xff) << 7);
+        for (cch = 0; cch < 4; cch++)
+            cb_on[cch] = (rsp_clip_blend16_rs(cb_on[cch], cb_off[cch],
+                                              wc, wt) >> 7) & 0xff;
+        out->r = cb_on[0] << 16;
+        out->g = cb_on[1] << 16;
+        out->b = cb_on[2] << 16;
+        out->a = cb_on[3] << 16;
+        out->sv = (int16_t)rsp_clip_blend16_rs(onv->sv, offv->sv, wc, wt);
+        out->tv = (int16_t)rsp_clip_blend16_rs(onv->tv, offv->tv, wc, wt);
+        out->s = (int32_t)((uint32_t)(int32_t)out->sv << 17);
+        out->t = (int32_t)((uint32_t)(int32_t)out->tv << 17);
+        gsp_clip_vertex_flags(st, out);
+        gsp_vertex_screen(st, out);
+        /* The overlay transforms the new record through the shared
+         * vertex path after the colour store (jal at 0x1fb4), and the
+         * transform writes the record's fog byte unconditionally, so
+         * the lerped alpha is overwritten by the fog factor of the new
+         * vertex's own z. */
+        {
+            int32_t f = rsp_fog_rs(out->rs_ndc2z,
+                                   st->rs_fog_mi, st->rs_fog_mf,
+                                   st->rs_fog_oi, st->rs_fog_of,
+                                   st->rs_fog_k);
+            out->a = (int32_t)((f & 0xff) << 16);
+        }
+        return;
+    }
+    on_attr[0] = (int16_t)(((onv->r >> 16) & 0xff) << 7);
+    on_attr[1] = (int16_t)(((onv->g >> 16) & 0xff) << 7);
+    on_attr[2] = (int16_t)(((onv->b >> 16) & 0xff) << 7);
+    on_attr[3] = (int16_t)(((onv->a >> 16) & 0xff) << 7);
+    /* The vertex pipeline stores the texture coordinates as the vmudm mid
+     * read of st * texscale -- HALF the value this pipeline carries (the
+     * doubling the triangle write needs is applied at the bridge). The
+     * RSP's clip lerp interpolates the stored halves; lerping the doubled
+     * values truncates differently in the low bit, so convert to the
+     * stored domain here (>> 17 is exact: the stored mid read always fits
+     * 15 bits plus sign) and back after. */
+    on_attr[4] = onv->sv;
+    on_attr[5] = onv->tv;
+    on_attr[6] = 0; on_attr[7] = 0;
+    off_attr[0] = (int16_t)(((offv->r >> 16) & 0xff) << 7);
+    off_attr[1] = (int16_t)(((offv->g >> 16) & 0xff) << 7);
+    off_attr[2] = (int16_t)(((offv->b >> 16) & 0xff) << 7);
+    off_attr[3] = (int16_t)(((offv->a >> 16) & 0xff) << 7);
+    off_attr[4] = offv->sv;
+    off_attr[5] = offv->tv;
+    off_attr[6] = 0; off_attr[7] = 0;
+    rsp_clip_lerp(on_pos, off_pos, cr, on_attr, off_attr, out_pos, out_attr);
+    out->cx = out_pos[0]; out->cy = out_pos[1];
+    out->cz = out_pos[2]; out->cw = out_pos[3];
+    /* suv truncates the lerped color lanes to bytes (>> 7). */
+    out->r = (int32_t)(((out_attr[0] >> 7) & 0xff) << 16);
+    out->g = (int32_t)(((out_attr[1] >> 7) & 0xff) << 16);
+    out->b = (int32_t)(((out_attr[2] >> 7) & 0xff) << 16);
+    out->a = (int32_t)(((out_attr[3] >> 7) & 0xff) << 16);
+    out->sv = out_attr[4];
+    out->tv = out_attr[5];
+    out->s = (int32_t)((uint32_t)(int32_t)out_attr[4] << 17);
+    out->t = (int32_t)((uint32_t)(int32_t)out_attr[5] << 17);
+    gsp_clip_vertex_flags(st, out);
+    gsp_vertex_screen(st, out);
+}
+
+static int clip_polygon_guard(GSPState *st, GSPVertex *poly, int n)
+{
+    GSPVertex tmp[GSP_CLIP_MAX];
+    int cond;
+    int ncond = st->rs_clip_model ? 5 : 6;
+    for (cond = 0; cond < ncond && n > 0; cond++)
+    {
+        static const unsigned int rs_cond_mask[5] = {
+            0x0040u, 0x4000u, 0x0200u, 0x0100u, 0x0002u
+        };
+        unsigned int mask = gsp_clip_cond_mask[cond];
+        int16_t cr[4];
+        int i, m = 0;
+        unsigned int f3;
+        int i3;
+        cr[0] = gsp_clip_ratio_rows[cond][0];
+        cr[1] = gsp_clip_ratio_rows[cond][1];
+        cr[2] = gsp_clip_ratio_rows[cond][2];
+        cr[3] = gsp_clip_ratio_rows[cond][3];
+        if (cond == 0)
+        {
+            /* non-NoN microcodes carry z + w >= 0 as the near plane (data
+             * table row {0,0,1,1}); the gating outcode is the VCH z-lane
+             * negative bit instead of the behind-the-eye w bit. */
+            cr[2] = (int16_t)st->clip_near_z;
+            if (st->clip_near_z)
+                mask = 1u << 6;     /* CLIP_NZ */
+        }
+        if (cond >= 2)  /* the +-x/+-y guard-band planes scale with the ratio */
+            cr[3] = (int16_t)((cr[3] < 0) ? -st->clip_ratio : st->clip_ratio);
+        if (st->clip_fan_first >= 2)
+        {
+            /* Wipeout 64's clip driver (overlay i764-i7dc) walks the
+             * pointer list linearly from vertex 0 -- vertex first, then
+             * the crossing on its outgoing edge -- and closes the wrap
+             * edge last, so the rebuilt list starts with vertex 0's
+             * contribution and any wrap-edge crossing lands at the end.
+             * The standard walk starts at the wrap edge, rotating the
+             * list (and the fan cut from it). */
+            for (i = 0; i < n; i++)
+            {
+                int inx = (i + 1 == n) ? 0 : (i + 1);
+                unsigned int f2 = st->rs_clip_model
+                    ? ((unsigned int)poly[i].rs_outcode & rs_cond_mask[cond])
+                    : ((unsigned int)poly[i].clip & mask);
+                unsigned int fn = st->rs_clip_model
+                    ? ((unsigned int)poly[inx].rs_outcode & rs_cond_mask[cond])
+                    : ((unsigned int)poly[inx].clip & mask);
+                if (!f2 && m < GSP_CLIP_MAX)
+                    tmp[m++] = poly[i];
+                if ((f2 != fn) && m < GSP_CLIP_MAX)
+                {
+                    const GSPVertex *onv  = f2 ? &poly[inx] : &poly[i];
+                    const GSPVertex *offv = f2 ? &poly[i]   : &poly[inx];
+                    gsp_clip_subdivide(st, &tmp[m], onv, offv, cr);
+                    m++;
+                }
+            }
+        }
+        else
+        {
+        f3 = st->rs_clip_model
+            ? ((unsigned int)poly[n - 1].rs_outcode & rs_cond_mask[cond])
+            : ((unsigned int)poly[n - 1].clip & mask);
+        i3 = n - 1;
+        for (i = 0; i < n; i++)
+        {
+            unsigned int f2 = st->rs_clip_model
+                ? ((unsigned int)poly[i].rs_outcode & rs_cond_mask[cond])
+                : ((unsigned int)poly[i].clip & mask);
+            if (f2 != f3)
+            {
+                const GSPVertex *onv  = f2 ? &poly[i3] : &poly[i];
+                const GSPVertex *offv = f2 ? &poly[i]  : &poly[i3];
+                if (m < GSP_CLIP_MAX)
+                {
+                    gsp_clip_subdivide(st, &tmp[m], onv, offv, cr);
+                    m++;
+                }
+            }
+            if (!f2 && m < GSP_CLIP_MAX)
+                tmp[m++] = poly[i];
+            f3 = f2;
+            i3 = i;
+        }
+        }
+        for (i = 0; i < m; i++)
+            poly[i] = tmp[i];
+        n = m;
+        if (n < 3)
+            return 0;
+    }
+    return n;
+}
+
+/* Fold and recenter the S10.5 texture coordinates of one triangle onto a
+ * coherent wrap branch, and emit the bias. Runs per emitted triangle,
+ * after clipping, like the rasterizer-facing coordinate handling: the
+ * RSP's clip lerp itself operates on the raw stored S10.5 values. */
+static void gsp_fold_st(GSPState *s, GSPVertex *v)
+{
+    /* Fold the S10.5 texture coordinates of b and c onto a's wrap branch.
+     * The 16-bit S10.5 texel coordinates are only meaningful modulo 65536:
+     * games author vertices on either side of the signed wrap (e.g. +29976
+     * and -30145 on the Kokiri Forest ground, truly 5415 apart) and rely on
+     * the hardware's 16-bit attribute deltas taking the short way around;
+     * the per-pixel tile mask absorbs the absolute offset (65536 S10.5 =
+     * 2048 texels, a multiple of every power-of-two mask). Differencing the
+     * values in wider arithmetic instead takes the long way -- here it made
+     * the S plane sweep ~60000 instead of ~5400 across the giant clipped
+     * ground triangles, painting the floor texture at a ~10x wrong
+     * frequency (the scanline-streak artifact). Folding must happen before
+     * the guard-band clip so the clip lerp interpolates on the coherent
+     * branch as the RSP's 16-bit lerp does. */
+    {
+        int dkr = !s->viewport.rsp_screen_model;
+        /* On the F3DDKR path the wide fields are the << 16 form and the
+         * stored shorts are the exact raw values; fold from the shorts
+         * (>> 16 of the wide form is identical, but the shorts are the
+         * authoritative domain the clip lerp also uses). */
+        int32_t sref = dkr ? (int32_t)v[0].sv : (v[0].s >> 16);
+        int32_t tref = dkr ? (int32_t)v[0].tv : (v[0].t >> 16);
+        int k2;
+        int32_t sv[3], tv[3], mn, mx;
+
+        sv[0] = sref;
+        tv[0] = tref;
+        for (k2 = 1; k2 < 3; k2++)
+        {
+            int32_t vs2 = dkr ? (int32_t)v[k2].sv : (v[k2].s >> 16);
+            int32_t vt2 = dkr ? (int32_t)v[k2].tv : (v[k2].t >> 16);
+            sv[k2] = sref + ((((vs2 - sref) + 0x8000) & 0xffff) - 0x8000);
+            tv[k2] = tref + ((((vt2 - tref) + 0x8000) & 0xffff) - 0x8000);
+        }
+        /* The folded branch can leave the representable S10.5 range (e.g.
+         * folding -27658 onto +29976's branch gives +37878, whose s15.16
+         * form overflows int32), and the coherent interval can even cross
+         * the +/-32768 boundary so that no 65536-aligned shift fits.
+         * Recenter the whole triangle around zero in steps of the tile's
+         * wrap period (mask texels * 32 in S10.5; 65536 when the tile
+         * geometry is unavailable or not a power of two): shifting all
+         * three vertices by a multiple of the mask period lands on the
+         * same texels after the per-pixel mask, so the offset is
+         * invisible. Coordinates needing the fold only occur on
+         * wrap-reliant content, where the mask is active by construction.
+         * If recentring still cannot fit the values, leave the originals
+         * untouched (the pre-fold behaviour). */
+        {
+            int32_t pers = 0, pert = 0, sh;
+            int32_t sh_s = 0, sh_t = 0;
+            int fit = 1;
+            int ti = s->tex_tile & 7;
+            if (s->tile_mask_s[ti])
+                pers = 32 << s->tile_mask_s[ti];
+            if (s->tile_mask_t[ti])
+                pert = 32 << s->tile_mask_t[ti];
+            mn = sv[0]; mx = sv[0];
+            for (k2 = 1; k2 < 3; k2++)
+            {
+                if (sv[k2] < mn) mn = sv[k2];
+                if (sv[k2] > mx) mx = sv[k2];
+            }
+            sh = pers ? (int32_t)((((int64_t)mn + mx) / 2) / pers) * pers : 0;
+            if (mn - sh < -32768 || mx - sh > 32767)
+                fit = 0;
+            else
+            {
+                for (k2 = 0; k2 < 3; k2++) sv[k2] -= sh;
+                sh_s = sh;
+            }
+            mn = tv[0]; mx = tv[0];
+            for (k2 = 1; k2 < 3; k2++)
+            {
+                if (tv[k2] < mn) mn = tv[k2];
+                if (tv[k2] > mx) mx = tv[k2];
+            }
+            sh = pert ? (int32_t)((((int64_t)mn + mx) / 2) / pert) * pert : 0;
+            if (mn - sh < -32768 || mx - sh > 32767)
+                fit = 0;
+            else
+            {
+                for (k2 = 0; k2 < 3; k2++) tv[k2] -= sh;
+                sh_t = sh;
+            }
+            /* The recenter shift feeds only the legacy emitters, which
+             * rebuild the absolute coordinate branch from it; the RSP
+             * triangle write consumes the exact stored shorts instead. */
+            emit_set_st_bias(fit ? sh_s : 0, fit ? sh_t : 0);
+            emit_set_st_wide_double(dkr);
+            if (fit)
+                for (k2 = 0; k2 < 3; k2++)
+                {
+                    v[k2].s = sv[k2] << 16;
+                    v[k2].t = tv[k2] << 16;
+                }
+        }
+    }
+}
+
+/* gsp_line: render a Doom 64 automap G_LINE3D (gSPLine3D v0,v1) as the
+ * gspL3DEX line microcode does -- expand the segment between two stored
+ * vertices into a thin screen-space quad and emit it as two triangles.
+ * The two endpoints carry their store-time screen snapshot (scr_x/scr_y in
+ * s15.16, .25-quantized; 1 pixel == 0x10000); offset each perpendicular to
+ * the segment by a half line width and feed the four corners straight to the
+ * bridge with their screen coordinates authoritative (scr_valid). */
+int gsp_line(GSPState *s, int32_t *cmd, int i0, int i1, int width_q)
+{
+    RspTriVtx r[2];
+    const GSPVertex *e;
+    GSPVertex va, vb;
+    int k;
+
+    if (i0 < 0 || i0 >= GSP_MAX_VERTICES ||
+        i1 < 0 || i1 >= GSP_MAX_VERTICES)
+        return 0;
+
+    /* Trivial rejection: a segment whose endpoints share a set clip
+     * outcode bit is dropped whole (the classic outcode AND test on the
+     * vertex processor's VCH flags; the 0x8000 bit of each half rides
+     * along on every vertex and is excluded). On a zoomed-out Doom 64
+     * automap this rejects 181 of 288 segments, matching the microcode's
+     * stream exactly; segments with only one endpoint out are drawn
+     * full-length with raw coordinates (overhangs to 20 px appear in the
+     * stream unclipped). A segment crossing the screen with both
+     * endpoints out far enough to flag would be 3D-clipped by the
+     * microcode instead; none appears in any capture and it stays
+     * unimplemented. */
+    if ((s->vtx[i0].clip & s->vtx[i1].clip & 0x7fff7fffu) != 0)
+        return 0;
+
+    /* Segment clip: when an endpoint carries scaled (guard-band) clip
+     * outcodes, the microcode 3D-clips the segment against the flagged
+     * homogeneous planes through the same clip-lerp routine the triangle
+     * clipper uses: the out endpoint is replaced by the plane
+     * intersection interpolated in clip space with the RSP's exact
+     * reciprocal chain, colours interpolated alongside, and the new
+     * vertex re-run through the standard projection and outcode
+     * computation. Screen-only overhangs (out at most a couple of
+     * pixels, below the scaled compare) stay unclipped and draw raw,
+     * matching the microcode's own stream. */
+    va = s->vtx[i0];
+    vb = s->vtx[i1];
+    if (s->line_clip_3d)
+    {
+        int cond;
+        for (cond = 0; cond < 6; cond++)
+        {
+            unsigned int mask = gsp_clip_cond_mask[cond];
+            int16_t cr[4];
+            unsigned int fa, fb;
+            cr[0] = gsp_clip_ratio_rows[cond][0];
+            cr[1] = gsp_clip_ratio_rows[cond][1];
+            cr[2] = gsp_clip_ratio_rows[cond][2];
+            cr[3] = gsp_clip_ratio_rows[cond][3];
+            if (cond == 0)
+            {
+                cr[2] = (int16_t)s->clip_near_z;
+                if (s->clip_near_z)
+                    mask = 1u << 6;
+            }
+            if (cond >= 2)
+                cr[3] = (int16_t)((cr[3] < 0) ? -s->clip_ratio
+                                              : s->clip_ratio);
+            fa = (unsigned int)va.clip & mask;
+            fb = (unsigned int)vb.clip & mask;
+            if (fa && fb)
+                return 0;       /* both out on the plane: degenerate */
+            if (fa)
+                gsp_clip_subdivide(s, &va, &va, &vb, cr);
+            else if (fb)
+                gsp_clip_subdivide(s, &vb, &vb, &va, cr);
+        }
+    }
+
+    /* The line microcodes emit each segment as a single YM==YL
+     * parallelogram command (see rsp_line_write); build the two endpoint
+     * records from the stored screen snapshots and colours. */
+    for (k = 0; k < 2; k++)
+    {
+        e = k ? &vb : &va;
+        r[k].x = (int16_t)(e->scr_x >> 14);
+        r[k].y = (int16_t)(e->scr_y >> 14);
+        r[k].z = e->scr_z;
+        r[k].r = (e->r >> 16) & 0xff;
+        r[k].g = (e->g >> 16) & 0xff;
+        r[k].b = (e->b >> 16) & 0xff;
+        r[k].a = (e->a >> 16) & 0xff;
+        /* gspL3DEX's vertex path drops the two low alpha bits (every
+         * 255-alpha automap vertex reaches the RDP as 252 in the
+         * microcode's own stream); Blast Corps' line build passes the
+         * byte through raw (its fog-authored trail alphas 0x72/0x6f
+         * arrive exact). */
+        if (s->line_alpha_mask)
+            r[k].a &= 0xfc;
+        r[k].s = 0; r[k].t = 0;
+        r[k].invw = e->rsp_invw;
+        r[k].pw = e->rs_pw;
+        r[k].flat2d = 0;
+    }
+
+    /* Both line microcode builds emit a Set Scissor ahead of every line
+     * command: a full-height window over the segment's x extent when the
+     * segment is wider than tall (the x-major and transposed forms'
+     * edges overshoot the endpoints horizontally at the cap scanlines),
+     * and a restore of the display list's current scissor otherwise.
+     * The window keeps the current scissor's y range and flag bits.
+     * Rejected segments emit neither. */
+    {
+        int n = rsp_line_write(cmd + 2, &r[0], &r[1], width_q,
+                               s->viewport.tri_dx_scale ? s->viewport.tri_dx_scale : 0x4000,
+                               s->viewport.tri_idy_scale ? s->viewport.tri_idy_scale : 0x0008,
+                               (int32_t)0xfff8, s->line_xl,
+                               s->line_z && (s->geometry_mode & GEOM_ZBUFFER));
+        if (n == 0 || !s->scis_valid)
+        {
+            int k;
+            if (n == 0)
+                return 0;
+            for (k = 0; k < n; k++)
+                cmd[k] = cmd[k + 2];
+            return n;
+        }
+        {
+            int32_t dxa = (int32_t)r[1].x - (int32_t)r[0].x;
+            int32_t dya = (int32_t)r[1].y - (int32_t)r[0].y;
+            if (dxa < 0) dxa = -dxa;
+            if (dya < 0) dya = -dya;
+            if (dxa > dya)
+            {
+                int32_t x0 = r[0].x < r[1].x ? r[0].x : r[1].x;
+                int32_t x1 = r[0].x < r[1].x ? r[1].x : r[0].x;
+                int32_t c0 = (int32_t)((s->scis_w0 >> 12) & 0xfff);
+                int32_t c1 = (int32_t)((s->scis_w1 >> 12) & 0xfff);
+                /* the window is clamped into the current scissor's x
+                 * range (an off-screen endpoint would otherwise wrap in
+                 * the 12-bit field) */
+                if (x0 < c0) x0 = c0;
+                if (x1 > c1) x1 = c1;
+                if (x1 < x0) x1 = x0;
+                cmd[0] = (int32_t)((s->scis_w0 & 0xff000fffu)
+                                   | (((uint32_t)x0 & 0xfffu) << 12));
+                cmd[1] = (int32_t)((s->scis_w1 & 0x03000fffu)
+                                   | (((uint32_t)x1 & 0xfffu) << 12));
+            }
+            else
+            {
+                cmd[0] = s->scis_w0;
+                cmd[1] = s->scis_w1;
+            }
+        }
+        return n + 2;
+    }
+}
+int gsp_triangle(GSPState *s, int32_t *cmd, int i0, int i1, int i2,
+                 int textured, int z_buffered)
+{
+    GSPVertex poly[GSP_CLIP_MAX];
+    int np;
+    const GSPVertex *a, *b, *c;
+    unsigned int oa, ob, oc;
+
+    if (i0 < 0 || i0 >= GSP_MAX_VERTICES ||
+        i1 < 0 || i1 >= GSP_MAX_VERTICES ||
+        i2 < 0 || i2 >= GSP_MAX_VERTICES)
+        return 0;
+
+    a = &s->vtx[i0]; b = &s->vtx[i1]; c = &s->vtx[i2];
+
+    /* Z bit comes from the G_ZBUFFER geometry-mode bit, not the othermode. */
+    z_buffered = (s->geometry_mode & GEOM_ZBUFFER) ? 1 : 0;
+
+    /* Trivial reject: the RSP tests the AND of the three vertices' stored
+     * VCH clip outcodes against CLIP_ALL_SCRN -- if every vertex lies
+     * outside the same screen plane (including the z lanes, and including
+     * the behind-the-eye encodings the VCH compare produces for w <= 0),
+     * the triangle is dropped before any clipping. The guard-band clipper
+     * below only sees triangles that survive this. */
+    if (s->rs_clip_model
+        ? (((unsigned int)a->rs_outcode & (unsigned int)b->rs_outcode
+            & (unsigned int)c->rs_outcode & 0x7070u) != 0u)
+        : (a->clip & b->clip & c->clip
+        & (unsigned int)(s->clip_near_z
+                         ? ((GSP_CLIP_REJECT & ~GSP_CLIP_NW) | GSP_CLIP_NZ)
+                         : GSP_CLIP_REJECT)))
+        return 0;
+
+    /* The RSP enters the clipper when any vertex's stored outcode has any
+     * bit of the scaled x/y conditions or the screen near/far conditions
+     * set; otherwise the triangle is drawn directly. */
+    oa = (unsigned int)a->clip;
+    ob = (unsigned int)b->clip;
+    oc = (unsigned int)c->clip;
+
+    if (s->clip_fan_first == 2)
+    {
+        /* Wipeout 64's clip driver (overlay IMEM 0x748, i764: sh
+         * r3/r2/r1) seeds its working list with the triangle vertices
+         * reversed, so the rebuilt polygon -- and the fan cut from it --
+         * walk the opposite way around. */
+        poly[0] = *c;
+        poly[1] = *b;
+        poly[2] = *a;
+    }
+    else if (s->clip_fan_first == 3)
+    {
+        /* Rogue Squadron's clip overlay seeds the list forward (live
+         * IMEM 0x1dc4: sh t3/t4/t5) and uses the same linear walk, but
+         * the fan passes its arguments forward: (list[0], list[k],
+         * list[k+1]) into the writer (1e10..1e44). */
+        poly[0] = *a;
+        poly[1] = *b;
+        poly[2] = *c;
+    }
+    else
+    {
+        poly[0] = *a;
+        poly[1] = *b;
+        poly[2] = *c;
+    }
+
+    np = 3;
+#define GSP_CLIP_TRIGGER ((1u << 20) | (1u << 21) | (1u << 28) | (1u << 29) \
+                        | (1u << 14) | (1u << 7))
+    if (s->clip_reject)
+    {
+        /* F3DLX.Rej / F3DZEX.Rej have no polygon clipper. The rejection
+         * microcode drops a triangle whole when any vertex falls outside
+         * the guard band (the same scaled x/y outcodes the clipper would
+         * trigger on) or behind the eye; geometry inside the band is
+         * passed straight to the rasterizer, which the scissor then trims
+         * to the screen. Mirror that: reject on the clip trigger instead
+         * of subdividing, so the emitter does not fabricate the boundary
+         * fan triangles a clipper would. Excitebike 64 swaps to this
+         * build (alongside F3DEX.NoN) for its 3D scenes. */
+        if ((oa | ob | oc) & (GSP_CLIP_TRIGGER | (1u << 6)))
+            return 0;
+    }
+    else if (s->rs_clip_model
+             ? (((unsigned int)a->rs_outcode | (unsigned int)b->rs_outcode
+                 | (unsigned int)c->rs_outcode) & 0x4343u)
+             : ((oa | ob | oc) & (GSP_CLIP_TRIGGER
+                          | (s->clip_near_z ? (1u << 6) : 0u))))
+    {
+        /* Polygon clip against the guard band the way the RSP microcode
+         * does: triangles that straddle w <= 0 cannot be passed through to
+         * the rasterizer (the 1/w attribute planes of such a triangle are
+         * not the planes of its visible portion, so scissoring is not
+         * equivalent), and steep overhang past the guard band loses
+         * coefficient precision. */
+        np = clip_polygon_guard(s, poly, np);
+        if (np < 3)
+            return 0;
+    }
+
+    /* Fan-triangulate the (possibly clipped) polygon and emit. */
+    {
+        int total = 0;
+        int i;
+        for (i = 0; i + 2 < np; i++)
+        {
+            BridgeVertex v0, v1, v2;
+            GSPVertex tv[3];
+            int nc;
+            /* Two fan styles, selected per microcode (see the fan probe
+             * in rdp_emit_hle.c): F3DEX2 2.05+/F3DZEX2 draws (0,1,n-1),
+             * (1,2,n-1), (2,3,n-1) -- consecutive ascending pairs fanned
+             * from the LAST polygon vertex -- while the 2.04H build keeps
+             * the FIRST vertex and walks the pairs downward from the end:
+             * (0,n-2,n-1), (0,n-3,n-2), ..., (0,1,2). The triangle sets
+             * differ (different pivot), so this is visible wherever a
+             * clipped polygon has more than three vertices. */
+            if (s->clip_fan_first == 2)
+            {
+                /* Wipeout 64 (i934-i95c): pivot on the FIRST list vertex,
+                 * walk ascending consecutive pairs, and the resident tri
+                 * write takes the args reversed (list[i+2], list[i+1],
+                 * pivot). */
+                tv[0] = poly[i + 2];
+                tv[1] = poly[i + 1];
+                tv[2] = poly[0];
+            }
+            else if (s->clip_fan_first == 3)
+            {
+                tv[0] = poly[0];
+                tv[1] = poly[i + 1];
+                tv[2] = poly[i + 2];
+            }
+            else if (s->clip_fan_first)
+            {
+                tv[0] = poly[0];
+                tv[1] = poly[np - 2 - i];
+                tv[2] = poly[np - 1 - i];
+            }
+            else
+            {
+                tv[0] = poly[i];
+                tv[1] = poly[i + 1];
+                tv[2] = poly[np - 1];
+            }
+            /* The fan loop routes each sub-triangle through the full
+             * triangle write, whose AND trivial-reject against the screen
+             * outcodes (the CLIP_ALL_SCRN constant, not the temporarily
+             * cleared activeClipPlanes) still applies: a guard-band
+             * polygon's fan can contain sub-triangles entirely past one
+             * screen plane, and the microcode drops those. */
+            /* The Rogue Squadron clip overlay re-enters the resident
+             * triangle writer past its outcode trivial-reject, so fan
+             * sub-triangles are never AND-rejected -- intersection
+             * vertices lie exactly on their planes and carry the
+             * inclusive vch bits, which would otherwise reject whole
+             * sub-triangles along the clipped edge. */
+            if (!s->rs_clip_model
+                && (tv[0].clip & tv[1].clip & tv[2].clip
+                & (unsigned int)(s->clip_near_z
+                                 ? ((GSP_CLIP_REJECT & ~GSP_CLIP_NW) | GSP_CLIP_NZ)
+                                 : GSP_CLIP_REJECT)) != 0u)
+                continue;
+            if (s->rs_clip_model && s->rs_fan_cull)
+            {
+                /* The re-entered writer's winding cull, on the clipped
+                 * sub-triangle's own screen positions (the same
+                 * saturated cross as the pre-clip test). */
+                int32_t fax = tv[0].scr_x >> 14, fay = tv[0].scr_y >> 14;
+                int32_t fbx = tv[1].scr_x >> 14, fby = tv[1].scr_y >> 14;
+                int32_t fd1x, fd1y, fd2x, fd2y, fcx, fcy;
+                int64_t facc;
+                fcx = tv[2].scr_x >> 14; fcy = tv[2].scr_y >> 14;
+#define RS_FSAT(v) ((v) > 32767 ? 32767 : ((v) < -32768 ? -32768 : (v)))
+                fd1x = RS_FSAT(fbx - fax); fd1y = RS_FSAT(fby - fay);
+                fd2x = RS_FSAT(fcx - fax); fd2y = RS_FSAT(fcy - fay);
+#undef RS_FSAT
+                facc = (int64_t)fd2x * fd1y - (int64_t)fd1x * fd2y;
+                if (facc == 0
+                    || (s->rs_fan_cull == 2 ? facc < 0 : facc > 0))
+                    continue;
+            }
+            gsp_fold_st(s, tv);
+            v0.cx = tv[0].cx; v0.cy = tv[0].cy; v0.cz = tv[0].cz; v0.cw = tv[0].cw;
+            v0.r = tv[0].r; v0.g = tv[0].g; v0.b = tv[0].b; v0.a = tv[0].a;
+            v0.s = tv[0].s; v0.t = tv[0].t;
+            v0.sv = tv[0].sv; v0.tv = tv[0].tv;
+            v0.scr_valid = 1;
+            v0.scr_x = tv[0].scr_x; v0.scr_y = tv[0].scr_y;
+            v0.scr_z = tv[0].scr_z; v0.w_raw = tv[0].w_raw;
+            v0.rsp_ok = tv[0].rsp_ok; v0.rsp_invw = tv[0].rsp_invw;
+            v0.rs_pw = tv[0].rs_pw;
+            v0.flat2d = tv[0].flat2d;
+            v1.cx = tv[1].cx; v1.cy = tv[1].cy; v1.cz = tv[1].cz; v1.cw = tv[1].cw;
+            v1.r = tv[1].r; v1.g = tv[1].g; v1.b = tv[1].b; v1.a = tv[1].a;
+            v1.s = tv[1].s; v1.t = tv[1].t;
+            v1.sv = tv[1].sv; v1.tv = tv[1].tv;
+            v1.scr_valid = 1;
+            v1.scr_x = tv[1].scr_x; v1.scr_y = tv[1].scr_y;
+            v1.scr_z = tv[1].scr_z; v1.w_raw = tv[1].w_raw;
+            v1.rsp_ok = tv[1].rsp_ok; v1.rsp_invw = tv[1].rsp_invw;
+            v1.rs_pw = tv[1].rs_pw;
+            v1.flat2d = tv[1].flat2d;
+            v2.cx = tv[2].cx; v2.cy = tv[2].cy; v2.cz = tv[2].cz; v2.cw = tv[2].cw;
+            v2.r = tv[2].r; v2.g = tv[2].g; v2.b = tv[2].b; v2.a = tv[2].a;
+            v2.s = tv[2].s; v2.t = tv[2].t;
+            v2.sv = tv[2].sv; v2.tv = tv[2].tv;
+            v2.scr_valid = 1;
+            v2.scr_x = tv[2].scr_x; v2.scr_y = tv[2].scr_y;
+            v2.scr_z = tv[2].scr_z; v2.w_raw = tv[2].w_raw;
+            v2.rsp_ok = tv[2].rsp_ok; v2.rsp_invw = tv[2].rsp_invw;
+            v2.rs_pw = tv[2].rs_pw;
+            v2.flat2d = tv[2].flat2d;
+            nc = bridge_add_triangle(cmd + total, &v0, &v1, &v2, &s->viewport,
+                                     textured, z_buffered,
+                                     (s->geometry_mode & 0x00000004u) ? 1 : 0,
+                                     (s->geometry_mode & 0x00200000u) ? 1 : 0,
+                                     s->rs_clip_model
+                                         ? 0
+                                         : (int)((s->geometry_mode >> 9) & 3u),
+                                     s->tex_tile, s->tex_level, s->tex_w, s->tex_h);
+            if (nc > 0)
+                total += nc;
+        }
+        return total;
+    }
+}
